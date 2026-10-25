@@ -50,11 +50,28 @@ if grep -q "id: $ROW_ID" "$PATCH_FILE"; then
   echo "==> the bundle row is already in $PATCH_FILE"
 else
   echo "==> adding the bundle row to $PATCH_FILE"
-  cat >> "$PATCH_FILE" <<YAML
+  # An empty list ("[]") cannot be followed by list items: the profile template
+  # starts with one, so the entry replaces it instead of being appended.
+  awk -v id="$ROW_ID" -v pkg="$PACKAGE" '
+    /^[[:space:]]*\[\][[:space:]]*$/ && !replaced {
+      print "- insert:"
+      print "    - id: " id
+      print "      name: '\''" pkg "'\''"
+      replaced = 1
+      next
+    }
+    { print }
+  ' "$PATCH_FILE" > "$PATCH_FILE.tmp"
+  if grep -q "id: $ROW_ID" "$PATCH_FILE.tmp"; then
+    mv "$PATCH_FILE.tmp" "$PATCH_FILE"
+  else
+    rm -f "$PATCH_FILE.tmp"
+    cat >> "$PATCH_FILE" <<YAML
 - insert:
     - id: $ROW_ID
       name: '$PACKAGE'
 YAML
+  fi
 fi
 
 cat <<DONE
