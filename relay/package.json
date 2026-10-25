@@ -1,0 +1,28 @@
+{
+  "name": "dsh-remote-control-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone relay for DeepSeek Harness Remote Control \u2014 deploy it on a public host to reach your agent from a phone anywhere.",
+  "exports": {
+    ".": "./server.js"
+  },
+  "bin": {
+    "dsh-remote-relay": "./server.js"
+  },
+  "files": [
+    "server.js",
+    "src/*.js",
+    "README.md"
+  ],
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT",
+  "author": "Ethan Song",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/colsonSung/dsh-remote-control.git",
+    "directory": "relay"
+  }
+}

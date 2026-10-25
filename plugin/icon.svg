@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Remote Control">
+  <rect x="12" y="6" width="40" height="34" rx="5" fill="none" stroke="#2f6feb" stroke-width="3"/>
+  <path d="M4 44a28 28 0 0 1 28-28" fill="none" stroke="#2f6feb" stroke-width="3" stroke-linecap="round"/>
+  <path d="M4 54a40 40 0 0 1 40-40" fill="none" stroke="#2f6feb" stroke-width="3" stroke-linecap="round" opacity="0.45"/>
+  <rect x="20" y="14" width="10" height="10" rx="2" fill="#2f6feb"/>
+  <rect x="34" y="14" width="10" height="10" rx="2" fill="#2f6feb"/>
+  <rect x="20" y="28" width="10" height="10" rx="2" fill="#2f6feb" opacity="0.45"/>
+  <rect x="34" y="28" width="10" height="10" rx="2" fill="#2f6feb"/>
+  <path d="M26 52h12l-6 8z" fill="#2f6feb"/>
+</svg>

@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+*.tgz
+# The relay's runtime state: it holds phone credentials.
+state.json
+*.state.json
+package-lock.json
+pnpm-lock.yaml

@@ -1,0 +1,54 @@
+{
+  "name": "dsh-remote-control",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Remote Control \u2014 drive this DeepSeek Harness agent from your phone through a Kimi-Code-style relay tunnel.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "src/*.js"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings-general",
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  },
+  "license": "MIT",
+  "author": "Ethan Song",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "remote-control",
+    "kimi-code"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/colsonSung/dsh-remote-control.git",
+    "directory": "plugin"
+  },
+  "homepage": "https://github.com/colsonSung/dsh-remote-control#readme"
+}
