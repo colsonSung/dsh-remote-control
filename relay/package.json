@@ -3,7 +3,7 @@
   "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Standalone relay for DeepSeek Harness Remote Control \u2014 deploy it on a public host to reach your agent from a phone anywhere.",
+  "description": "Standalone relay for DeepSeek Harness Remote Control — deploy it on a public host to reach your agent from a phone anywhere.",
   "exports": {
     ".": "./server.js"
   },

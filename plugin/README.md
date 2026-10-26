@@ -78,6 +78,28 @@ against the build's hashed class names, so it survives a release. If the frame
 ever changes shape, the selector stops matching and the app keeps its own
 layout.
 
+The rule is a **fallback**: a frame that already carries the sidebar-appearance
+plugin's drawer (`sa-frame`) belongs to that plugin, which positions the column
+itself and takes the conversation behind it out of the pointer event path. The
+grid here only applies on a profile without that plugin, so two plugins never
+stretch the same column and the layout does not depend on stylesheet order.
+
+### The drawer closes after the tap, never before it
+
+On a phone the drawer is a modal surface over the conversation: using
+something inside it closes the drawer, so the conversation gets the whole
+screen back. The dismissal waits for the **click**, never for the press. A
+press is the beginning of a gesture, and closing the drawer on it took the
+pressed control out from under the finger before the browser dispatched the
+click — the click then landed on the conversation behind the drawer and the
+control never ran at all. A session row had to be tapped twice to open, and
+the first tap looked like it did nothing. By the time the click is dispatched
+the drawer is still in place, the control has handled its own tap, and the
+drawer closes on the next task.
+
+The sidebar's own collapse control is exempt from the dismissal: it must
+stay a toggle rather than become a close.
+
 ### The sidebar's own controls are unmistakable on a phone
 
 The shell has both controls already - the panel icon in the expanded

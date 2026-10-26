@@ -1,5 +1,5 @@
 /**
- * Host half of `@local/remote-control`.
+ * Host half of `dsh-remote-control`.
  *
  * The plugin mirrors Kimi Code's remote control: the host dials OUT to a relay
  * over two WebSockets, the relay replays a remote phone's HTTP traffic back

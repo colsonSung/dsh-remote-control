@@ -164,6 +164,21 @@ EXPOSE 8080
 CMD ["node", "server.js"]
 ```
 
+## Long-lived responses
+
+A request that answers with a body that never ends — an event stream — is
+forwarded to the phone **chunk by chunk**: the head goes out first, every
+chunk follows as it arrives, and the phone sees them live. The relay keeps
+such a request alive with an idle window of five minutes, because an event
+stream says nothing between its events; a request that has not been answered
+at all still has to answer within thirty seconds.
+
+A relay also tells the Harness what it can do when the device registers. The
+`binary_body` capability lets the host send the body of a response as one
+binary message, and `ws_binary_body` does the same for the payload of a
+WebSocket. Both save the base64 inflation, which is a third of the bytes on
+the link that is the bottleneck.
+
 ## The access link is only half the credential
 
 A device registers an `access_key` (in the link) and a `passcode` (never in the
@@ -184,6 +199,18 @@ every relay session at once.
 A phone that unlocks once keeps a credential of its own (`dsh-device`, 180
 days) and shows up in the device list. The owner marks a phone as **trusted**,
 and from then on it skips the access code.
+
+## A restart does not lock the phones out
+
+The session cookie a phone gets after it types the access code is **derived**,
+not random: the relay computes it from its own secret and the phone's own
+credential, so a restart can recompute it. A deploy, a crash or a reboot
+therefore leaves every phone exactly where it was — before the change, every
+restart threw the sessions away and each phone had to type the access code
+again, and the app answered `401` until it did.
+
+Forgetting a phone takes its session with it: the session cannot be recomputed
+any more, because the credential it is derived from is gone.
 
 ## Managing devices and phones
 

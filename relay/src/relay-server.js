@@ -28,7 +28,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
 import { dirname } from 'node:path'
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { randomBytes, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { WebSocket, WebSocketServer } from 'ws'
 
 import {
@@ -36,7 +36,9 @@ import {
   TUNNEL_PATH,
   abortFrame,
   CAPABILITY_BINARY_BODY,
+  CAPABILITY_WS_BINARY_BODY,
   decodeBinaryBody,
+  decodeBinaryWsPayload,
   decodeFrame,
   encodeFrame,
   registerAckFrame,
@@ -106,6 +108,16 @@ const STRIPPED_RESPONSE_HEADERS = new Set([
 /** How long the relay waits for the host to answer one proxied request. */
 const REQUEST_TIMEOUT_MS = 30_000
 
+/**
+ * How long a streamed response may stay quiet before the relay calls it
+ * stalled.
+ *
+ * An event stream carries nothing between its events, and the phone waits
+ * for the next one: the window has to be measured in minutes, not in the
+ * seconds a request may take.
+ */
+const STREAM_IDLE_TIMEOUT_MS = 300_000
+
 /** How long the relay waits for the host to accept a WebSocket upgrade. */
 const UPGRADE_TIMEOUT_MS = 15_000
 
@@ -147,12 +159,15 @@ const NAK_REASONS = {
  * @typedef {object} PendingRequest
  * @property {string} id
  * @property {any} device
+ * @property {import('node:http').ServerResponse} res the phone's response
+ * @property {string} session the relay's own session cookie for the phone
  * @property {(value: {status: number, headers: Record<string, string | string[]>, body: Buffer}) => void} resolve
  * @property {(reason: Error) => void} reject
- * @property {NodeJS.Timeout} timer
+ * @property {NodeJS.Timeout | undefined} timer
  * @property {Buffer[]} chunks accumulated chunked response body
  * @property {Record<string, string | string[]> | null} headers status/headers of a chunked response
  * @property {number} status
+ * @property {boolean} streaming whether the response is streamed to the phone
  */
 
 /**
@@ -313,6 +328,8 @@ function isServerLike(value) {
  * @param {string} [options.publicBaseUrl] base URL a phone should open; defaults to the request `Host`
  * @param {string} [options.devicePath] per-device path prefix, `''` mounts at the root
  * @param {(message: string, extra?: Record<string, unknown>) => void} [options.log]
+ * @param {number} [options.requestTimeoutMs] how long the relay waits for the host; defaults to 30 s
+ * @param {number} [options.streamIdleTimeoutMs] how long a stream may stay quiet; defaults to 5 min
  * @returns {{
  *   listen: (options?: {host?: string, port?: number, server?: http.Server | https.Server}) => Promise<{host: string, port: number}>,
  *   address: () => {host: string | null, port: number, url: string | null},
@@ -328,6 +345,8 @@ export function createRelayServer(options = {}) {
     devicePath: rawDevicePath,
     log: rawLog,
     statePath: rawStatePath,
+    requestTimeoutMs: rawRequestTimeoutMs,
+    streamIdleTimeoutMs: rawStreamIdleTimeoutMs,
   } = options || {}
 
   if (typeof token !== 'string' || token.trim() === '') {
@@ -340,6 +359,20 @@ export function createRelayServer(options = {}) {
   let configuredPublicBaseUrl = normalizeBaseUrl(rawPublicBaseUrl)
   const log = typeof rawLog === 'function' ? rawLog : () => {}
   const bearerProtocol = `kimi-code.bearer.${secret}`
+  // How long the relay waits for the host: a hard deadline for a request that
+  // has not been answered yet, an idle window for one that streams.
+  const requestTimeoutMs =
+    Number.isFinite(rawRequestTimeoutMs) && Number(rawRequestTimeoutMs) > 0
+      ? Number(rawRequestTimeoutMs)
+      : REQUEST_TIMEOUT_MS
+  // How long a stream may stay quiet. An event stream is quiet most of the
+  // time - the plugin hot-reload stream says nothing until something changes -
+  // so the window that guards a request is far too short for one. The host
+  // keeps the connection open, and a stream that really dies closes it.
+  const streamIdleTimeoutMs =
+    Number.isFinite(rawStreamIdleTimeoutMs) && Number(rawStreamIdleTimeoutMs) > 0
+      ? Number(rawStreamIdleTimeoutMs)
+      : STREAM_IDLE_TIMEOUT_MS
 
   /** @type {Map<string, any>} */
   const devices = new Map()
@@ -790,6 +823,8 @@ export function createRelayServer(options = {}) {
       for (const [token, candidate] of device.phones) {
         if (candidate.id === phoneId) {
           device.phones.delete(token)
+          // A forgotten phone loses its session with it.
+          device.phoneSessions.delete(phoneSessionToken(device.deviceId, token))
           break
         }
       }
@@ -1094,6 +1129,24 @@ export function createRelayServer(options = {}) {
   }
 
   /**
+   * The session token of one phone.
+   *
+   * The token is derived, not random: a relay that restarts can recompute it
+   * from the phone's own credential and the relay's secret, so a deploy does
+   * not lock every phone out until it types the access code again. Removing a
+   * phone from the list takes its session with it.
+   *
+   * @param {string} deviceId the device the phone belongs to
+   * @param {string} phoneToken the phone's own credential
+   * @returns {string}
+   */
+  function phoneSessionToken(deviceId, phoneToken) {
+    return createHmac('sha256', secret)
+      .update(`session:${deviceId}:${phoneToken}`)
+      .digest('base64url')
+  }
+
+  /**
    * Decide whether a phone request carries a valid access credential.
    *
    * The access key in the link is the credential: it is accepted once, and the
@@ -1115,7 +1168,19 @@ export function createRelayServer(options = {}) {
     // An unlocked phone carries the relay's own session cookie; that is the
     // only way past the passcode.
     const cookie = readCookie(req, PHONE_SESSION_COOKIE)
-    if (cookie && device.phoneSessions.has(cookie)) return { ok: true, session: '' }
+    if (cookie) {
+      if (device.phoneSessions.has(cookie)) return { ok: true, session: '' }
+      // A session that was minted before the relay restarted is still good:
+      // the token is derived from the phone's own credential, so the relay can
+      // recompute it.
+      if (phone !== undefined) {
+        const derived = phoneSessionToken(device.deviceId, phone.token)
+        if (secretsEqual(cookie, derived)) {
+          device.phoneSessions.add(cookie)
+          return { ok: true, session: '' }
+        }
+      }
+    }
 
     const key = url.searchParams.get('k') ?? ''
     if (!device.accessKey || !secretsEqual(key, device.accessKey)) {
@@ -1123,19 +1188,33 @@ export function createRelayServer(options = {}) {
     }
     if (!device.passcode) {
       // No passcode configured: the link itself is the credential.
-      const session = randomBytes(24).toString('base64url')
+      const session = newSessionFor(device, phone)
       device.phoneSessions.add(session)
       return { ok: true, session }
     }
     if (trusted) {
       // A phone the owner marked as trusted skips the access code.
-      const session = randomBytes(24).toString('base64url')
+      const session = newSessionFor(device, phone)
       device.phoneSessions.add(session)
       return { ok: true, session }
     }
     // The link is valid, but the device asks for a passcode before it hands
     // out a session.
     return { ok: false, session: '', reason: 'passcode' }
+  }
+
+  /**
+   * Mint the session token of one phone.
+   *
+   * @param {any} device the device the phone belongs to
+   * @param {any} phone the phone record
+   * @returns {string}
+   */
+  function newSessionFor(device, phone) {
+    if (phone === undefined || typeof phone.token !== 'string') {
+      return randomBytes(24).toString('base64url')
+    }
+    return phoneSessionToken(device.deviceId, phone.token)
   }
 
   /**
@@ -1519,11 +1598,11 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    const session = randomBytes(24).toString('base64url')
-    device.phoneSessions.add(session)
     // The phone keeps its own credential, so the owner can recognise it and
     // mark it trusted; a trusted phone skips the access code from then on.
     const phone = rememberPhone(device, req)
+    const session = newSessionFor(device, phone)
+    device.phoneSessions.add(session)
     res.writeHead(303, {
       location: url.pathname,
       'set-cookie': [
@@ -1640,19 +1719,27 @@ export function createRelayServer(options = {}) {
     const pending = {
       id,
       device,
+      res,
+      session,
       chunks: [],
       headers: null,
       status: 0,
-      timer: setTimeout(() => {
-        if (!inflight.has(id)) return
-        inflight.delete(id)
-        sendToHost(device, abortFrame(id))
-        sendPlain(res, 504, 'host did not answer in time')
-      }, REQUEST_TIMEOUT_MS),
+      streaming: false,
+      timer: undefined,
       resolve: (value) => {
         if (!inflight.has(id)) return
         inflight.delete(id)
         clearTimeout(pending.timer)
+        if (pending.streaming === true) {
+          // The head is on the wire already, so the body cannot be sent as one
+          // piece any more: it becomes the last chunk of the stream.
+          try {
+            res.end(value.body)
+          } catch {
+            /* client already gone */
+          }
+          return
+        }
         const responseHeaders = sanitizeResponseHeaders(value.headers || {})
         responseHeaders['content-length'] = String(value.body.length)
         if (session) appendSessionCookie(responseHeaders, session)
@@ -1667,11 +1754,22 @@ export function createRelayServer(options = {}) {
         if (!inflight.has(id)) return
         inflight.delete(id)
         clearTimeout(pending.timer)
+        if (res.headersSent) {
+          // The head is on the wire already, so the status can no longer be
+          // changed: the stream is cut instead of answered with a 502.
+          try {
+            res.destroy()
+          } catch {
+            /* client already gone */
+          }
+          return
+        }
         sendPlain(res, 502, reason && reason.message ? reason.message : 'upstream error')
       },
     }
 
     inflight.set(id, pending)
+    armRequestTimer(pending)
 
     if (!sendToHost(device, frame)) {
       inflight.delete(id)
@@ -1688,6 +1786,94 @@ export function createRelayServer(options = {}) {
         sendToHost(device, abortFrame(id))
       }
     })
+  }
+
+  /**
+   * (Re)arm the timer of one in-flight request.
+   *
+   * Before the response head arrives the timer is a hard deadline: the host
+   * has to answer within the window. Once the response streams, it becomes an
+   * idle timer: every chunk that arrives pushes the deadline out, so a live
+   * stream is never killed while a stalled one still is.
+   *
+   * @param {PendingRequest} pending
+   * @param {number} [delay] the window in milliseconds
+   */
+  function armRequestTimer(pending, delay = pending.streaming ? streamIdleTimeoutMs : requestTimeoutMs) {
+    clearTimeout(pending.timer)
+    pending.timer = setTimeout(() => {
+      if (!inflight.has(pending.id)) return
+      inflight.delete(pending.id)
+      sendToHost(pending.device, abortFrame(pending.id))
+      if (pending.res.headersSent) {
+        // The head is on the wire already, so the status can no longer be
+        // changed: the stream is cut instead of answered with a 504.
+        logInfo('relay: a streamed response stalled', { id: pending.id })
+        try {
+          pending.res.destroy()
+        } catch {
+          /* client already gone */
+        }
+        return
+      }
+      sendPlain(pending.res, 504, 'host did not answer in time')
+    }, delay)
+  }
+
+  /**
+   * Write the head of a streamed response to the phone.
+   *
+   * The length of such a body is unknown, so no content-length is sent and
+   * Node falls back to chunked transfer encoding. Everything else travels as
+   * the host sent it.
+   *
+   * The head is flushed, not only stored: a phone that waits for the head of
+   * an event stream has to get it before the first event arrives.
+   *
+   * @param {PendingRequest} pending
+   */
+  function writeStreamHead(pending) {
+    const headers = sanitizeResponseHeaders(pending.headers || {})
+    delete headers['content-length']
+    if (pending.session) appendSessionCookie(headers, pending.session)
+    try {
+      pending.res.writeHead(pending.status || 200, headers)
+      pending.res.flushHeaders?.()
+    } catch (error) {
+      logInfo('relay: failed to write the response head', { error: String(error) })
+    }
+  }
+
+  /**
+   * Forward one chunk of a streamed response to the phone.
+   *
+   * @param {PendingRequest} pending
+   * @param {Buffer} chunk
+   */
+  function writeStreamChunk(pending, chunk) {
+    if (chunk.length === 0) return
+    if (pending.res.writableEnded || pending.res.destroyed) return
+    try {
+      pending.res.write(chunk)
+    } catch (error) {
+      logInfo('relay: failed to forward a chunk', { error: String(error) })
+    }
+  }
+
+  /**
+   * Finish a streamed response.
+   *
+   * @param {PendingRequest} pending
+   */
+  function endStream(pending) {
+    if (!inflight.has(pending.id)) return
+    inflight.delete(pending.id)
+    clearTimeout(pending.timer)
+    try {
+      pending.res.end()
+    } catch (error) {
+      logInfo('relay: failed to end the streamed response', { error: String(error) })
+    }
   }
 
   /**
@@ -2025,7 +2211,7 @@ export function createRelayServer(options = {}) {
       registerAckFrame({
         deviceId,
         publicUrl,
-        capabilities: [CAPABILITY_BINARY_BODY],
+        capabilities: [CAPABILITY_BINARY_BODY, CAPABILITY_WS_BINARY_BODY],
       }),
     )
     logInfo('relay: device registered', { deviceId, publicUrl })
@@ -2100,10 +2286,21 @@ export function createRelayServer(options = {}) {
     logInfo('relay: tunnel channel opened', { deviceId })
 
     socket.on('message', (data, isBinary) => {
-      // A binary message carries the body of a response, not a frame. The
-      // flag is what tells them apart: a text frame that arrives in one
+      // A binary message carries neither a frame nor always a body: it can
+      // hold a WebSocket payload or the body of a response. The payload says
+      // so itself, so it is read first; anything else is a body. The flag is
+      // what tells a frame apart from both: a text frame that arrives in one
       // piece is handed over as a Buffer, too.
       if (isBinary === true) {
+        const payload = decodeBinaryWsPayload(data)
+        if (payload !== undefined) {
+          try {
+            handleHostBinaryWsPayload(device, payload)
+          } catch (error) {
+            logInfo('relay: binary ws payload failed', { deviceId, error: String(error) })
+          }
+          return
+        }
         try {
           handleHostBinaryBody(device, data)
         } catch (error) {
@@ -2207,9 +2404,18 @@ export function createRelayServer(options = {}) {
       return
     }
     if (frame.chunked === true) {
+      // A response that streams: the head carries the status and the headers,
+      // the body follows in chunks. The head goes to the phone right away and
+      // every chunk is forwarded as it arrives, so a response that never ends
+      // (an event stream) reaches the phone instead of being timed out.
       pending.status = Number(frame.status) || 200
       pending.headers = frame.headers || {}
       pending.chunks = []
+      pending.streaming = true
+      writeStreamHead(pending)
+      // From here on the timer is an idle timer: a stream that keeps sending
+      // must not die on the deadline that guards a request with no answer.
+      armRequestTimer(pending)
       return
     }
     if (frame.body_encoding === 'binary') {
@@ -2265,7 +2471,11 @@ export function createRelayServer(options = {}) {
   }
 
   /**
-   * Accumulate a chunk of a chunked response.
+   * Forward one chunk of a chunked response.
+   *
+   * A response that streams is handed to the phone as it arrives; one that
+   * arrives without a head is still collected, so a host that does not know
+   * about the chunked head keeps working.
    *
    * @param {any} device
    * @param {Record<string, any>} frame
@@ -2273,11 +2483,20 @@ export function createRelayServer(options = {}) {
   function handleHostResponseChunk(device, frame) {
     const pending = inflight.get(String(frame.id))
     if (!pending) return
+    const chunk = decodeBody(frame.chunk, frame.body_encoding)
+    if (pending.streaming === true) {
+      // The phone gets the bytes as they arrive, and every chunk pushes the
+      // idle window out.
+      armRequestTimer(pending)
+      writeStreamChunk(pending, chunk)
+      if (frame.last === true) endStream(pending)
+      return
+    }
     if (pending.status === 0) {
       pending.status = Number(frame.status) || 200
       pending.headers = frame.headers || {}
     }
-    pending.chunks.push(decodeBody(frame.chunk, frame.body_encoding))
+    pending.chunks.push(chunk)
     if (frame.last === true) {
       pending.resolve({
         status: pending.status,
@@ -2309,14 +2528,39 @@ export function createRelayServer(options = {}) {
    * @param {Record<string, any>} frame
    */
   function handleHostWsFrame(device, frame) {
-    const bridge = bridges.get(String(frame.id))
-    if (!bridge) return
     const payload = decodeBody(frame.data, frame.body_encoding)
+    forwardWsPayload(String(frame.id), payload, frame.binary === true)
+  }
+
+  /**
+   * Forward one WebSocket payload that arrived as a binary tunnel message.
+   *
+   * A payload that travels as a binary message pays for no base64 inflation,
+   * and the biggest one - a session snapshot - is megabytes.
+   *
+   * @param {any} device
+   * @param {{id: string, payload: Buffer, binary: boolean}} decoded
+   */
+  function handleHostBinaryWsPayload(device, decoded) {
+    forwardWsPayload(String(decoded.id), decoded.payload, decoded.binary === true)
+  }
+
+  /**
+   * Hand one WebSocket payload to the phone's socket.
+   *
+   * The kind of the message travels with the payload: guessing it from the
+   * bytes turns a binary payload into a text one and breaks the peer protocol.
+   *
+   * @param {string} id the bridge the payload belongs to
+   * @param {Buffer} payload
+   * @param {boolean} binary whether the payload is a binary one
+   */
+  function forwardWsPayload(id, payload, binary) {
+    const bridge = bridges.get(id)
+    if (!bridge) return
     try {
       if (bridge.peer.readyState !== WebSocket.OPEN) return
-      // The frame kind travels in the frame: guessing it from the bytes
-      // turns a binary payload into a text one and breaks the peer protocol.
-      if (frame.binary === true) bridge.peer.send(payload)
+      if (binary === true) bridge.peer.send(payload)
       else bridge.peer.send(payload.toString('utf8'))
     } catch (error) {
       logInfo('relay: failed to forward ws frame', { error: String(error) })

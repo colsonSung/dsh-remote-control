@@ -1,5 +1,5 @@
 /**
- * Client half of `@local/remote-control`: the Settings page named
+ * Client half of `dsh-remote-control`: the Settings page named
  * "Remote Control".
  *
  * The page mirrors Kimi Code's panel — a switch, a QR code that carries the
@@ -682,8 +682,13 @@ function installMobileSidebarLayout() {
   style.textContent = [
     '@media (max-width: 1023px) {',
     '  /* The expanded sidebar takes the whole screen: the frame gives it every',
-    '     pixel and the conversation goes behind it. */',
-    '  :has(> [data-shell-overlay]):not([data-sidebar-collapsed]) {',
+    '     pixel and the conversation goes behind it.',
+    '     A frame that already carries the sidebar-appearance drawer (`sa-frame`)',
+    '     belongs to that plugin: it positions the column itself, so this grid',
+    '     stays only as the fallback for a profile without that plugin. Two',
+    '     plugins stretching the same column makes the layout depend on',
+    '     stylesheet order, which is not worth keeping. */',
+    '  :has(> [data-shell-overlay]):not([data-sidebar-collapsed]):not(.sa-frame) {',
     '    grid-template-columns: 100% 0 0 !important;',
     '  }',
     '  /* The drawer is the whole screen now: its resize handle has nothing',
@@ -1481,7 +1486,17 @@ window.__ModuleLoader__.load({
       // Tapping inside the expanded menu dismisses it, the way a phone menu
       // behaves: the layout keeps the menu expanded over the conversation
       // until something inside it is used.
-      const onPointerDown = (event) => {
+      //
+      // The dismissal waits for the *click*, never for the press. A press is
+      // the beginning of a gesture, and closing the drawer on it took the
+      // pressed control out from under the finger before the browser
+      // dispatched the click: on a phone the click then landed on the
+      // conversation behind the drawer and the control never ran at all — a
+      // session row had to be tapped twice to open, and the first tap looked
+      // like it did nothing. By the time the click is dispatched the drawer is
+      // still in place and the control has handled its own tap; the drawer
+      // closes afterwards, on the next task.
+      const onClick = (event) => {
         if (!isNarrowViewport()) return
         const frame = layoutFrame()
         if (frame === null || frame.hasAttribute('data-sidebar-collapsed')) return
@@ -1492,12 +1507,13 @@ window.__ModuleLoader__.load({
         // The toggle itself must keep working as a toggle.
         const control = target.closest('button,[role="button"]')
         const label = control?.getAttribute('aria-label') ?? ''
-        if (/^(open|close|hide|show|toggle)\s+sidebar$/i.test(label)) return
+        if (/^(open|close|collapse|hide|show|toggle)\s+sidebar$/i.test(label)) return
+        if (/^(打开|收起|关闭|隐藏|显示)侧边栏$/.test(label)) return
         scheduleCollapse(0)
         scheduleCollapse(280)
       }
-      document.addEventListener('pointerdown', onPointerDown, true)
-      restores.push(() => document.removeEventListener('pointerdown', onPointerDown, true))
+      document.addEventListener('click', onClick, true)
+      restores.push(() => document.removeEventListener('click', onClick, true))
 
       const title = document.querySelector('title')
       if (title !== null) {
