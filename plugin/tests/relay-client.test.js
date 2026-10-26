@@ -13,12 +13,15 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import { test } from 'node:test'
+import { gunzipSync } from 'node:zlib'
 
 import { WebSocketServer } from 'ws'
 
-import { createRelayClient } from '../src/relay-client.js'
+import { createRelayClient, sessionCookieName } from '../src/relay-client.js'
 import {
   abortFrame,
+  CAPABILITY_BINARY_BODY,
+  decodeBinaryBody,
   decodeFrame,
   encodeFrame,
   registerAckFrame,
@@ -43,10 +46,18 @@ class FrameInbox {
     this.socket = socket
     /** @type {Record<string, unknown>[]} */
     this.frames = []
+    /** @type {Buffer[]} the binary messages the socket sent */
+    this.binaries = []
     /** @type {{ predicate: Function, resolve: Function, timer: NodeJS.Timeout }[]} */
     this.waiters = []
 
-    socket.on('message', (data) => {
+    socket.on('message', (data, isBinary) => {
+      // The flag is what tells a binary message apart from a text frame: a
+      // text frame that arrives in one piece is handed over as a Buffer, too.
+      if (isBinary === true) {
+        this.binaries.push(Buffer.isBuffer(data) ? data : Buffer.from(data))
+        return
+      }
       let frame
       try {
         frame = decodeFrame(data.toString())
@@ -90,11 +101,32 @@ class FrameInbox {
   find(predicate) {
     return this.frames.find(predicate)
   }
+
+  /**
+   * Wait for the next binary message the socket sent.
+   *
+   * A binary message arrives as its own WebSocket message, so it may land
+   * after the text frame that announced it.
+   *
+   * @param {number} [timeoutMs]
+   * @returns {Promise<Buffer>}
+   */
+  async nextBinary(timeoutMs = 4_000) {
+    const started = Date.now()
+    while (this.binaries.length === 0) {
+      if (Date.now() - started > timeoutMs) {
+        throw new Error('timed out waiting for a binary message')
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    return this.binaries.shift()
+  }
 }
 
 /** The fake relay: management + tunnel channels over one HTTP server. */
 class FakeRelay extends EventEmitter {
-  constructor() {
+  /** @param {{ capabilities?: string[] }} [options] */
+  constructor(options = {}) {
     super()
     this.server = http.createServer((req, res) => {
       res.writeHead(404, { 'content-type': 'text/plain' })
@@ -119,6 +151,8 @@ class FakeRelay extends EventEmitter {
     this.urls = []
     /** @type {string|null} when set, the relay refuses the registration */
     this.nakReason = null
+    /** @type {string[]} the capabilities the relay advertises */
+    this.capabilities = options.capabilities ?? []
 
     this.server.on('upgrade', (req, socket, head) => {
       this.wss.handleUpgrade(req, socket, head, (ws) => {
@@ -146,6 +180,7 @@ class FakeRelay extends EventEmitter {
                 registerAckFrame({
                   deviceId: /** @type {string} */ (frame.device_id),
                   publicUrl: PUBLIC_URL,
+                  capabilities: this.capabilities,
                 }),
               ),
             )
@@ -474,16 +509,17 @@ test('does not inject the launch token once the phone has a session cookie', asy
   await client.start()
   const tunnel = await relay.waitFor('tunnel')
 
-  // The phone already holds the signed session cookie: the host must not
-  // trade the launch token in again, or the server would answer a fresh
-  // redirect on every load and the phone would loop forever.
+  // The phone already holds the signed session cookie of this server: the
+  // host must not trade the launch token in again, or the server would answer
+  // a fresh redirect on every load and the phone would loop forever.
+  const cookie = `${sessionCookieName(`127.0.0.1:${upstream.port}`)}=signed-session`
   tunnel.socket.send(
     encodeFrame(
       requestFrame({
         id: 'req-with-cookie',
         method: 'GET',
         path: '/',
-        headers: { cookie: 'dsh-auth-abc123=signed-session; Path=/' },
+        headers: { cookie },
         body: null,
       }),
     ),
@@ -492,7 +528,173 @@ test('does not inject the launch token once the phone has a session cookie', asy
   await tunnel.next((frame) => frame.type === 'response')
   assert.equal(upstream.requests.length, 1)
   assert.equal(upstream.requests[0].url, '/')
-  assert.equal(upstream.requests[0].headers.cookie, 'dsh-auth-abc123=signed-session; Path=/')
+  assert.equal(upstream.requests[0].headers.cookie, cookie)
+})
+
+test('trades the launch token in again when the session cookie belongs to another authority', async (t) => {
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream()
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  // The Harness web server listens on an ephemeral port, so a restart of the
+  // app moves the authority and invalidates the cookie the phone kept. The
+  // host must not mistake that cookie for a live session: the server would
+  // answer 401 and the phone could never get back in.
+  const stale = `${sessionCookieName('127.0.0.1:59999')}=signed-session`
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-stale-cookie',
+        method: 'GET',
+        path: '/',
+        headers: { cookie: `dsh-rc=relay-session; ${stale}` },
+        body: null,
+      }),
+    ),
+  )
+
+  await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(upstream.requests.length, 1)
+  assert.equal(upstream.requests[0].url, '/?token=launch-secret')
+  // The phone's own cookies are passed through untouched.
+  assert.equal(upstream.requests[0].headers.cookie, `dsh-rc=relay-session; ${stale}`)
+})
+
+test('retries with the launch token when the server refuses the session cookie', async (t) => {
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    if (req.url.includes('token=')) {
+      res.writeHead(303, { location: './', 'set-cookie': 'dsh-auth-fresh=session' })
+      res.end()
+      return
+    }
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('dsh web authentication required')
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  // The cookie belongs to this authority, but the server refuses it — the
+  // signing secret changed. The host trades the launch token in again and the
+  // phone receives a fresh cookie.
+  const cookie = `${sessionCookieName(`127.0.0.1:${upstream.port}`)}=stale-session`
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-refused',
+        method: 'GET',
+        path: '/',
+        headers: { cookie },
+        body: null,
+      }),
+    ),
+  )
+
+  const response = await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(upstream.requests.length, 2)
+  assert.equal(upstream.requests[0].url, '/')
+  assert.equal(upstream.requests[1].url, '/?token=launch-secret')
+  assert.equal(response.status, 303)
+  assert.deepEqual(response.headers['set-cookie'], ['dsh-auth-fresh=session'])
+})
+
+test('does not retry a refused request outside the device root', async (t) => {
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('dsh web authentication required')
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  // The server only accepts the launch token on the device root, so a refused
+  // API call is answered as it is.
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-refused-api',
+        method: 'GET',
+        path: '/api/remote.mux',
+        headers: {},
+        body: null,
+      }),
+    ),
+  )
+
+  const response = await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(upstream.requests.length, 1)
+  assert.equal(upstream.requests[0].url, '/api/remote.mux')
+  assert.equal(response.status, 401)
+})
+
+test('gives up after one retry when the server refuses the launch token too', async (t) => {
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('dsh web authentication required')
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-refused-twice',
+        method: 'GET',
+        path: '/',
+        headers: {},
+        body: null,
+      }),
+    ),
+  )
+
+  const response = await tunnel.next((frame) => frame.type === 'response')
+  // The phone holds no cookie, so the first attempt already carried the
+  // launch token; the host must not loop.
+  assert.equal(upstream.requests.length, 1)
+  assert.equal(upstream.requests[0].url, '/?token=launch-secret')
+  assert.equal(response.status, 401)
 })
 
 test('injects the launch token when the cookie is not a session cookie', async (t) => {
@@ -559,6 +761,172 @@ test('keeps an existing token query parameter untouched', async (t) => {
   await tunnel.next((frame) => frame.type === 'response')
   assert.equal(upstream.requests.length, 1)
   assert.equal(upstream.requests[0].url, '/?token=phone-token&x=2')
+})
+
+test('compresses a large text response before it enters the tunnel', async (t) => {
+  const payload = 'const answer = 42; // '.repeat(4096)
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/javascript' })
+    res.end(payload)
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-big',
+        method: 'GET',
+        path: '/app.js',
+        headers: {},
+        body: null,
+      }),
+    ),
+  )
+
+  const response = await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(response.status, 200)
+  // The phone's browser decompresses on its own; the relay forwards the
+  // encoding untouched.
+  assert.equal(response.headers['content-encoding'], 'gzip')
+  const raw = Buffer.from(response.body, 'base64')
+  assert.equal(Number(response.headers['content-length']), raw.length)
+  // The tunnel carries the body base64-encoded, so the compression is what
+  // makes a remote relay bearable.
+  assert.ok(raw.length < payload.length / 2, `expected a smaller body, got ${raw.length}`)
+  assert.equal(gunzipSync(raw).toString('utf8'), payload)
+})
+
+test('leaves a small response and an already encoded one alone', async (t) => {  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    if (req.url === '/small.txt') {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('short')
+      return
+    }
+    // A body the server encoded itself stays as it is.
+    res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'br' })
+    res.end('encoded by the server')
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  tunnel.socket.send(
+    encodeFrame(requestFrame({ id: 'req-small', method: 'GET', path: '/small.txt', headers: {}, body: null })),
+  )
+  const small = await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(small.headers['content-encoding'], undefined)
+  assert.equal(Buffer.from(small.body, 'base64').toString('utf8'), 'short')
+
+  tunnel.socket.send(
+    encodeFrame(requestFrame({ id: 'req-encoded', method: 'GET', path: '/encoded.txt', headers: {}, body: null })),
+  )
+  const encoded = await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(encoded.headers['content-encoding'], 'br')
+  assert.equal(Buffer.from(encoded.body, 'base64').toString('utf8'), 'encoded by the server')
+})
+
+test('sends the body as a binary message when the relay accepts one', async (t) => {
+  const payload = 'const answer = 42; // '.repeat(4096)
+  const relay = new FakeRelay({ capabilities: [CAPABILITY_BINARY_BODY] })
+  const upstream = new FakeUpstream((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/javascript' })
+    res.end(payload)
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-binary',
+        method: 'GET',
+        path: '/app.js',
+        headers: {},
+        body: null,
+      }),
+    ),
+  )
+
+  const response = await tunnel.next((frame) => frame.type === 'response')
+  // The text frame carries the status and the headers, the binary message the
+  // bytes — no base64 inflation on a link that is the bottleneck.
+  assert.equal(response.body, null)
+  assert.equal(response.body_encoding, 'binary')
+  assert.equal(response.body_length, Number(response.headers['content-length']))
+  const decoded = decodeBinaryBody(await tunnel.nextBinary())
+  assert.ok(decoded !== undefined)
+  assert.equal(decoded.id, 'req-binary')
+  assert.equal(gunzipSync(decoded.body).toString('utf8'), payload)
+})
+
+test('keeps the JSON frame when the relay does not accept a binary body', async (t) => {
+  const payload = 'const answer = 42; // '.repeat(4096)
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/javascript' })
+    res.end(payload)
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-json',
+        method: 'GET',
+        path: '/app.js',
+        headers: {},
+        body: null,
+      }),
+    ),
+  )
+
+  const response = await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(response.body_encoding, 'base64')
+  assert.equal(tunnel.binaries.length, 0)
+  assert.equal(gunzipSync(Buffer.from(response.body, 'base64')).toString('utf8'), payload)
 })
 
 test('aborts the in-flight upstream request on an abort frame', async (t) => {

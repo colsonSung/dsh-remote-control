@@ -12,7 +12,10 @@
  *   GET /v1/remote/http?device_id=<id>&capabilities=...     tunnel
  *
  * Every frame is one JSON text message. Binary bodies travel base64-encoded
- * inside the frame so a relay can be a dumb pipe.
+ * inside the frame so a relay can be a dumb pipe. A relay that advertises the
+ * `binary_body` capability also accepts a body as one binary WebSocket
+ * message, which is the only way to send a large body without paying for the
+ * base64 inflation on a link that is the bottleneck.
  */
 
 export const PROTOCOL_VERSION = 1
@@ -25,6 +28,15 @@ export const TUNNEL_PATH = '/v1/remote/http'
 
 /** Capabilities the host advertises on the tunnel channel. */
 export const CAPABILITIES = ['request_chunk', 'response_chunk', 'abort']
+
+/**
+ * The capability a relay advertises when it accepts a body as one binary
+ * WebSocket message.
+ *
+ * The host only uses it when the relay says so, so an older relay keeps
+ * working with a newer host.
+ */
+export const CAPABILITY_BINARY_BODY = 'binary_body'
 
 /** WS subprotocol carrying the relay credential, Kimi-style: `kimi-code.bearer.<token>`. */
 export function bearerSubprotocol(token) {
@@ -81,7 +93,12 @@ export function registerFrame(input) {
  * @param {{deviceId: string, publicUrl: string}} input
  */
 export function registerAckFrame(input) {
-  return { type: 'register_ack', device_id: input.deviceId, public_url: input.publicUrl }
+  return {
+    type: 'register_ack',
+    device_id: input.deviceId,
+    public_url: input.publicUrl,
+    capabilities: input.capabilities ?? [],
+  }
 }
 
 /**
@@ -90,6 +107,47 @@ export function registerAckFrame(input) {
  */
 export function registerNakFrame(reason) {
   return { type: 'register_nak', reason }
+}
+
+/**
+ * Encode a response body as one binary WebSocket message.
+ *
+ * The body of a big response is the one thing that does not fit into a JSON
+ * frame without paying for it: base64 costs a third more bytes, and the
+ * tunnel of a remote relay is exactly where the bytes are scarce. The message
+ * carries the id of the request it answers, so the relay needs no ordering
+ * assumption between the text frame and the binary one.
+ *
+ * @param {string} id the request the body answers
+ * @param {Buffer} body the raw body bytes
+ * @returns {Buffer}
+ */
+export function encodeBinaryBody(id, body) {
+  const idBytes = Buffer.from(id, 'utf8')
+  const header = Buffer.alloc(4)
+  header.writeUInt32BE(idBytes.length, 0)
+  return Buffer.concat([header, idBytes, body])
+}
+
+/**
+ * Read the request id and the body out of a binary body message.
+ *
+ * @param {unknown} message the raw WebSocket message
+ * @returns {{ id: string, body: Buffer } | undefined}
+ */
+export function decodeBinaryBody(message) {
+  const buffer = Buffer.isBuffer(message)
+    ? message
+    : message instanceof ArrayBuffer
+      ? Buffer.from(message)
+      : ArrayBuffer.isView(message)
+        ? Buffer.from(message.buffer, message.byteOffset, message.byteLength)
+        : undefined
+  if (buffer === undefined || buffer.length < 4) return undefined
+  const length = buffer.readUInt32BE(0)
+  if (buffer.length < 4 + length) return undefined
+  const id = buffer.subarray(4, 4 + length).toString('utf8')
+  return { id, body: buffer.subarray(4 + length) }
 }
 
 /**
@@ -104,6 +162,10 @@ export function revokeFrame(reason) {
 
 /**
  * A phone HTTP request travelling relay -> host.
+ *
+ * The body is base64 and says so: a relay that has to guess would mistake a
+ * binary body for text.
+ *
  * @param {{id: string, method: string, path: string, headers: Record<string, string>, body: string | null}} input
  */
 export function requestFrame(input) {
@@ -114,6 +176,7 @@ export function requestFrame(input) {
     path: input.path,
     headers: input.headers ?? {},
     body: input.body ?? null,
+    body_encoding: input.body === null || input.body === undefined ? null : 'base64',
   }
 }
 
@@ -127,6 +190,11 @@ export function upgradeFrame(input) {
 
 /**
  * The host's HTTP response travelling host -> relay.
+ *
+ * The body is base64 and says so. A relay that has to guess reads a body as
+ * base64 only when the decoded bytes are valid UTF-8 — which a compressed
+ * body is not, and it would then deliver the base64 text itself.
+ *
  * @param {{id: string, status: number, headers: Record<string, string>, body: string | null}} input
  */
 export function responseFrame(input) {
@@ -136,6 +204,9 @@ export function responseFrame(input) {
     status: input.status,
     headers: input.headers ?? {},
     body: input.body ?? null,
+    body_encoding:
+      input.body_encoding ?? (input.body === null || input.body === undefined ? null : 'base64'),
+    ...(input.body_length === undefined ? {} : { body_length: input.body_length }),
   }
 }
 

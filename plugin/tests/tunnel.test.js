@@ -604,3 +604,82 @@ test('a revoked device is refused until the owner restores it', async (t) => {
   await new Promise((resolve) => setTimeout(resolve, 1500))
   assert.equal(client.status().state, 'online', 'the device registers again')
 })
+
+test('a device keeps the name the owner gave it', async (t) => {
+  const harness = await startFakeHarness()
+  const statePath = join(tmpdir(), `dsh-relay-alias-${Date.now()}.json`)
+  const relayPort = await freePort()
+  const relay = createRelayServer({
+    token: RELAY_SECRET,
+    publicBaseUrl: `http://127.0.0.1:${relayPort}`,
+    statePath,
+    log: () => {},
+  })
+  await relay.listen({ host: '127.0.0.1', port: relayPort })
+
+  const client = createRelayClient({
+    relayUrl: `ws://127.0.0.1:${relayPort}`,
+    token: RELAY_SECRET,
+    deviceId: DEVICE_ID,
+    alias: 'the-original-name',
+    platform: 'darwin',
+    clientVersion: '1.0.0',
+    localBaseUrl: harness.baseUrl,
+    launchToken: LAUNCH_TOKEN,
+    accessKey: ACCESS_KEY,
+    passcode: '24681357',
+    log: () => {},
+  })
+  t.after(async () => {
+    await client.stop().catch(() => {})
+    await relay.close().catch(() => {})
+    await harness.close()
+  })
+  await client.start()
+
+  const listDevices = async () => {
+    const response = await fetch(`http://127.0.0.1:${relayPort}/v1/remote/devices`, {
+      headers: { authorization: `Bearer ${RELAY_SECRET}` },
+    })
+    const list = await response.json()
+    return list.find((device) => device.deviceId === DEVICE_ID)
+  }
+
+  // The owner renames the device.
+  const renamed = await fetch(`http://127.0.0.1:${relayPort}/v1/remote/devices/${DEVICE_ID}/alias`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${RELAY_SECRET}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ alias: 'the-name-i-chose' }),
+  })
+  assert.equal(renamed.status, 200)
+  assert.equal((await listDevices()).alias, 'the-name-i-chose')
+
+  // The device registers again with its own name: the owner's name wins.
+  await client.stop().catch(() => {})
+  await client.start()
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  let afterRestart
+  try {
+    afterRestart = await listDevices()
+  } catch (error) {
+    throw new Error('listDevices after the re-registration failed: ' + String(error))
+  }
+  assert.equal(afterRestart.alias, 'the-name-i-chose', 'the owner name survives a re-registration')
+
+  // And it survives a relay restart.
+  await relay.close()
+  const restartedPort = await freePort()
+  const restarted = createRelayServer({
+    token: RELAY_SECRET,
+    publicBaseUrl: `http://127.0.0.1:${restartedPort}`,
+    statePath,
+    log: () => {},
+  })
+  await restarted.listen({ host: '127.0.0.1', port: restartedPort })
+  t.after(() => restarted.close().catch(() => {}))
+  const response = await fetch(`http://127.0.0.1:${restartedPort}/v1/remote/devices`, {
+    headers: { authorization: `Bearer ${RELAY_SECRET}` },
+  })
+  const list = await response.json()
+  assert.equal(list.find((device) => device.deviceId === DEVICE_ID).alias, 'the-name-i-chose')
+})

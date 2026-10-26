@@ -19,7 +19,9 @@ import { createRelayServer } from '../src/relay-server.js'
 import {
   MANAGEMENT_PATH,
   TUNNEL_PATH,
+  CAPABILITY_BINARY_BODY,
   decodeFrame,
+  encodeBinaryBody,
   encodeFrame,
   registerFrame,
   responseFrame,
@@ -47,6 +49,13 @@ async function startUpstream() {
           'set-cookie': ['a=1; Path=/', 'b=2; Path=/'],
         })
         res.end('cookies')
+        return
+      }
+      if (req.url && req.url.startsWith('/gzip')) {
+        // A body that is not valid UTF-8: a relay that guesses the encoding
+        // would hand the phone the base64 text instead of these bytes.
+        res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'gzip' })
+        res.end(Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe, 0xfd]))
         return
       }
       res.writeHead(200, { 'content-type': 'application/json', 'x-upstream': 'fake' })
@@ -227,6 +236,27 @@ class FakeHost {
       if (body) request.write(body)
       request.end()
     })
+    const binary = Array.isArray(this.ack?.capabilities)
+      && this.ack.capabilities.includes(CAPABILITY_BINARY_BODY)
+      && result.body.length > 0
+    if (binary) {
+      // The way a host answers a relay that accepts a binary body: the text
+      // frame carries the status and the headers, the message the bytes.
+      this.tunnel.send(
+        encodeFrame(
+          responseFrame({
+            id: frame.id,
+            status: result.status,
+            headers: result.headers,
+            body: null,
+            body_encoding: 'binary',
+            body_length: result.body.length,
+          }),
+        ),
+      )
+      this.tunnel.send(encodeBinaryBody(String(frame.id), result.body))
+      return
+    }
     this.tunnel.send(
       encodeFrame(
         responseFrame({
@@ -611,6 +641,74 @@ test('keeps every set-cookie of the upstream response', async (t) => {
   assert.equal(cookies.length, 2)
   assert.match(cookies[0], /a=1/)
   assert.match(cookies[1], /b=2/)
+})
+
+test('delivers a binary body as bytes, not as its base64 text', async (t) => {
+  const upstream = await startUpstream()
+  const { relay, url } = await startRelay()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const host = await new FakeHost({
+    relayUrl: url,
+    deviceId: 'device-binary',
+    localBaseUrl: upstream.url,
+  }).connect()
+  t.after(() => host.close())
+
+  const response = await new Promise((resolve, reject) => {
+    // A raw request: `fetch` would decompress the body on its own and hide
+    // what the relay actually delivered.
+    const request = http.get(`${url}/gzip`, (res) => {
+      const chunks = []
+      res.on('data', (chunk) => chunks.push(chunk))
+      res.on('end', () =>
+        resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }),
+      )
+    })
+    request.on('error', reject)
+  })
+  assert.equal(response.status, 200)
+  assert.equal(response.headers['content-encoding'], 'gzip')
+  // The bytes have to arrive unchanged: a relay that guessed the encoding
+  // would deliver the base64 text of a body that is not valid UTF-8.
+  assert.deepEqual([...response.body], [0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe, 0xfd])
+})
+
+test('delivers a body that arrives as a binary message', async (t) => {
+  const upstream = await startUpstream()
+  const { relay, url } = await startRelay()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const host = await new FakeHost({
+    relayUrl: url,
+    deviceId: 'device-binary-body',
+    localBaseUrl: upstream.url,
+  }).connect()
+  t.after(() => host.close())
+
+  // The relay advertises the capability, so the host answers with a binary
+  // message and the phone has to receive the very same bytes.
+  assert.ok(host.ack.capabilities.includes(CAPABILITY_BINARY_BODY))
+
+  const response = await new Promise((resolve, reject) => {
+    const request = http.get(`${url}/gzip`, (res) => {
+      const chunks = []
+      res.on('data', (chunk) => chunks.push(chunk))
+      res.on('end', () =>
+        resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }),
+      )
+    })
+    request.on('error', reject)
+  })
+  assert.equal(response.status, 200)
+  assert.equal(response.headers['content-encoding'], 'gzip')
+  assert.deepEqual([...response.body], [0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe, 0xfd])
 })
 
 test('answers 503 when the device has no live tunnel', async (t) => {

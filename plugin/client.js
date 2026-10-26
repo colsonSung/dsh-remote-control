@@ -152,6 +152,13 @@ window.__ModuleLoader__.load({
 .rc-note{display:flex;gap:6px;align-items:flex-start;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
 .rc-devices{display:flex;flex-direction:column;gap:8px}
 .rc-devices-head{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:500}
+.rc-overlay{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.28)}
+.rc-dialog{display:flex;flex-direction:column;gap:12px;min-width:320px;padding:18px 20px;border-radius:12px;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);box-shadow:0 18px 48px rgba(0,0,0,.24)}
+.rc-dialog-title{font-size:13px;font-weight:500}
+.rc-dialog-input{font-size:13px;padding:8px 10px;border-radius:7px;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-family:inherit}
+.rc-dialog-input:focus{outline:none;border-color:var(--dsw-alias-state-business-primary)}
+.rc-dialog-actions{display:flex;justify-content:flex-end;gap:8px}
+.rc-button-primary{background:var(--dsw-alias-state-business-primary);border-color:var(--dsw-alias-state-business-primary);color:#fff}
 .rc-device{display:flex;justify-content:space-between;align-items:center;gap:16px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;padding:12px 16px;background:var(--dsw-alias-bg-layer-1)}
 .rc-device-main{display:flex;flex-direction:column;gap:4px;min-width:0}
 .rc-device-name{display:flex;align-items:center;gap:8px;font-size:13px}
@@ -252,6 +259,50 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * A small modal that asks for a name.
+     *
+     * `window.prompt` does not work in the desktop app — Electron does not
+     * implement it — so the name is asked for in the page itself.
+     *
+     * @param {{title: string, initial: string, label: string, onSubmit: (value: string) => void, onCancel: () => void}} props
+     */
+    function NameDialog(props) {
+      const [value, setValue] = React.useState(props.initial ?? '')
+      const inputRef = React.useRef(null)
+      React.useEffect(() => {
+        const onKey = (event) => {
+          if (event.key === 'Escape') props.onCancel()
+          if (event.key === 'Enter') props.onSubmit(value)
+        }
+        window.addEventListener('keydown', onKey)
+        inputRef.current?.focus()
+        inputRef.current?.select()
+        return () => window.removeEventListener('keydown', onKey)
+      }, [])
+
+      return h('div', { className: 'rc-overlay', onClick: props.onCancel },
+        h('div', { className: 'rc-dialog', onClick: (event) => event.stopPropagation() },
+          h('div', { className: 'rc-dialog-title' }, props.title),
+          h('input', {
+            ref: inputRef,
+            className: 'rc-dialog-input',
+            value: value,
+            'aria-label': props.label,
+            onChange: (event) => setValue(event.target.value),
+            // Clicking into the field again replaces the name instead of
+            // appending to it.
+            onFocus: (event) => event.target.select(),
+          }),
+          h('div', { className: 'rc-dialog-actions' },
+            h('button', { type: 'button', className: 'rc-button', onClick: props.onCancel }, props.cancel),
+            h('button', {
+              type: 'button',
+              className: 'rc-button rc-button-primary',
+              onClick: () => props.onSubmit(value),
+            }, props.ok))))
+    }
+
+    /**
      * One row of "Remote device management".
      * @param {{device: Record<string, any>, t: Function, onRename: Function, onOffline: Function}} props
      */
@@ -343,11 +394,7 @@ window.__ModuleLoader__.load({
                 h('button', {
                   type: 'button',
                   className: 'rc-menu-item',
-                  onClick: () => {
-                    setOpen(false)
-                    const alias = window.prompt(t('rename'), phone.label || '')
-                    if (alias !== null && alias.trim().length > 0) props.onRename(alias.trim())
-                  },
+                  onClick: () => { setOpen(false); props.onRename(phone) },
                 }, t('rename')),
                 h('button', {
                   type: 'button',
@@ -369,6 +416,7 @@ window.__ModuleLoader__.load({
       const [copied, setCopied] = React.useState(false)
       const [error, setError] = React.useState(null)
       const [notice, setNotice] = React.useState(null)
+      const [renaming, setRenaming] = React.useState(null)
       const [relayUrl, setRelayUrl] = React.useState('')
       const [publicAddress, setPublicAddress] = React.useState('')
 
@@ -491,18 +539,36 @@ window.__ModuleLoader__.load({
             key: device.deviceId,
             device,
             t,
-            onRename: (target) => {
-              const alias = window.prompt(t('rename'), target.alias)
-              if (alias === null || alias.trim().length === 0) return
-              run('renameDevice', { deviceId: target.deviceId, alias: alias.trim() })
-                .then((ok) => { if (ok) setNotice(t('renamed')) })
-            },
+            onRename: (target) => setRenaming({ kind: 'device', id: target.deviceId, alias: target.alias ?? '' }),
             onOffline: (target) => {
               run('takeOffline', { deviceId: target.deviceId })
                 .then((ok) => { if (ok) setNotice(t('takenOffline')) })
             },
           })),
-          notice !== null ? h('div', { className: 'rc-muted' }, notice) : null),
+          notice !== null ? h('div', { className: 'rc-muted' }, notice) : null,
+        renaming !== null
+          ? h(NameDialog, {
+            title: t('rename'),
+            label: t('rename'),
+            initial: renaming.alias,
+            ok: t('save'),
+            cancel: t('cancel'),
+            onCancel: () => setRenaming(null),
+            onSubmit: (value) => {
+              const alias = value.trim()
+              const target = renaming
+              setRenaming(null)
+              if (alias.length === 0) return
+              if (target.kind === 'device') {
+                run('renameDevice', { deviceId: target.id, alias })
+                  .then((ok) => { if (ok) setNotice(t('renamed')) })
+                return
+              }
+              run('renamePhone', { phoneId: target.id, alias })
+                .then((ok) => { if (ok) setNotice(t('renamed')) })
+            },
+          })
+          : null),
 
         h('div', { className: 'rc-devices' },
           h('div', { className: 'rc-devices-head' },
@@ -516,7 +582,7 @@ window.__ModuleLoader__.load({
               t,
               busy,
               onTrust: (trusted) => { run('setPhoneTrust', { phoneId: phone.id, trusted }) },
-              onRename: (alias) => { run('renamePhone', { phoneId: phone.id, alias }) },
+              onRename: (target) => setRenaming({ kind: 'phone', id: target.id, alias: target.label ?? '' }),
               onRemove: () => {
                 // Removing a device is destructive: it has to enter the access
                 // code again, so ask first.

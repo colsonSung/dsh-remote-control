@@ -40,14 +40,19 @@
  * ```
  */
 
+import { createHash } from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
+import { promisify } from 'node:util'
+import { gzip } from 'node:zlib'
 import { WebSocket as NodeWebSocket } from 'ws'
 
 import {
   bearerHeader,
   bearerSubprotocol,
+  CAPABILITY_BINARY_BODY,
   decodeFrame,
+  encodeBinaryBody,
   encodeFrame,
   managementUrl,
   registerFrame,
@@ -98,6 +103,26 @@ const DROPPED_UPGRADE_HEADERS = new Set([
 
 /** Response headers that describe a connection, not the payload. */
 const DROPPED_RESPONSE_HEADERS = new Set(['connection', 'transfer-encoding'])
+
+/**
+ * The smallest body that is worth compressing.
+ *
+ * Below this the compression costs more time than the transfer saves, and the
+ * phone pays the latency of the round trip anyway.
+ */
+const MIN_COMPRESSED_BYTES = 4 * 1024
+
+/**
+ * The content types that gain from compression.
+ *
+ * Images, fonts and archives are already compressed; compressing them again
+ * only burns CPU on both ends.
+ */
+const COMPRESSIBLE_CONTENT_TYPES =
+  /^(?:text\/|application\/(?:javascript|json|xml|manifest\+json)|image\/svg\+xml)/i
+
+/** The gzip implementation, as a promise. */
+const gzipAsync = promisify(gzip)
 
 /** Subprotocol tokens allowed by RFC 6455 (`ws` validates against this too). */
 const SUBPROTOCOL_PATTERN = /^[!#$%&'*+\-.0-9A-Z^_`|a-z~]+$/
@@ -151,20 +176,110 @@ function splitRequestTarget(rawPath) {
 }
 
 /**
- * Whether the request already carries a Harness session cookie.
+ * The name the Harness server gives the browser-session cookie of one
+ * authority.
+ *
+ * The cookie is bound to the authority it was minted for: its name is
+ * `dsh-auth-<base64url(sha256(authority))>` and the signed payload carries
+ * the same authority. The Harness web server listens on an ephemeral port, so
+ * the authority changes whenever the app restarts — a cookie minted for the
+ * previous port is worthless and the server refuses it.
+ *
+ * @param {string} authority `host:port` of the local server
+ * @returns {string}
+ */
+export function sessionCookieName(authority) {
+  const digest = createHash('sha256').update(authority).digest('base64')
+  const encoded = digest.replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
+  return `dsh-auth-${encoded}`
+}
+
+/**
+ * Read one cookie value from a request's `Cookie` header.
+ *
+ * @param {Record<string, unknown>} headers
+ * @param {string} name
+ * @returns {string | undefined}
+ */
+function readCookie(headers, name) {
+  const raw = headers?.cookie
+  const value = Array.isArray(raw) ? raw.join('; ') : String(raw ?? '')
+  for (const segment of value.split(';')) {
+    const at = segment.indexOf('=')
+    if (at === -1) continue
+    if (segment.slice(0, at).trim() === name) return segment.slice(at + 1).trim()
+  }
+  return undefined
+}
+
+/**
+ * Whether the request already carries the Harness session cookie of the
+ * current authority.
  *
  * The launch token is exchanged for a signed cookie once: the first index
  * request trades the token in, and every later request presents the cookie.
  * Injecting the token again would make the server answer a fresh redirect on
  * every page load, and the phone would follow it forever.
  *
+ * A cookie of another authority does not count: the phone kept it across a
+ * restart of the Harness app, the server no longer accepts it, and counting it
+ * as a session would lock the phone out for good. Trading the token in again
+ * is the only way back.
+ *
  * @param {Record<string, unknown>} headers
+ * @param {string} authority `host:port` of the local server
  * @returns {boolean}
  */
-function hasSessionCookie(headers) {
-  const raw = headers?.cookie
-  const value = Array.isArray(raw) ? raw.join('; ') : String(raw ?? '')
-  return /(?:^|;\s*)dsh-auth-[^=]*=/.test(value)
+function hasSessionCookie(headers, authority) {
+  return readCookie(headers, sessionCookieName(authority)) !== undefined
+}
+
+/**
+ * Compress a response body that has to travel over a slow link.
+ *
+ * The tunnel carries a body base64-encoded inside a JSON frame, so every byte
+ * is paid for twice: once on the way to the relay and once on the way from it
+ * to the phone. Compressing *before* that encoding is what makes a remote
+ * relay bearable — the Harness web app is one client bundle of roughly 9 MB,
+ * which compresses to less than half of that.
+ *
+ * The compression happens here rather than in the Harness server because that
+ * server has its gzip middleware switched off by default, and this plugin is
+ * the only party that knows the link is slow. The relay forwards the body and
+ * the `content-encoding` header untouched, and the phone's browser
+ * decompresses it on its own.
+ *
+ * @param {number} status the upstream status
+ * @param {Record<string, unknown>} headers the upstream response headers
+ * @param {Buffer} body the upstream response body
+ * @returns {Promise<{ headers: Record<string, unknown>, body: Buffer }>}
+ */
+async function compressResponse(status, headers, body) {
+  if (status === 204 || status === 304) return { headers, body }
+  if (body.length < MIN_COMPRESSED_BYTES) return { headers, body }
+  // An encoded body stays as it is: the encoding is the server's business.
+  const encoding = headers['content-encoding']
+  if (typeof encoding === 'string' && encoding.length > 0) return { headers, body }
+  const type = String(headers['content-type'] ?? '')
+  if (!COMPRESSIBLE_CONTENT_TYPES.test(type)) return { headers, body }
+
+  let compressed
+  try {
+    compressed = await gzipAsync(body, { level: 6 })
+  } catch {
+    // A body that cannot be compressed is still a body that can be sent.
+    return { headers, body }
+  }
+  if (compressed.length >= body.length) return { headers, body }
+
+  return {
+    headers: {
+      ...headers,
+      'content-encoding': 'gzip',
+      'content-length': String(compressed.length),
+    },
+    body: compressed,
+  }
 }
 
 /**
@@ -324,6 +439,8 @@ export class RelayClient {
     this._error = null
     /** @type {boolean} */
     this._registered = false
+    /** @type {boolean} whether the relay accepts a body as a binary message */
+    this._binaryBodies = false
     /** @type {boolean} */
     this._stopped = true
 
@@ -755,8 +872,12 @@ export class RelayClient {
               ? frame.publicUrl
               : null
         this._publicUrl = publicUrl
+        // A relay that accepts a body as a binary message saves the base64
+        // inflation on every response; an older one keeps the JSON frame.
+        const capabilities = Array.isArray(frame.capabilities) ? frame.capabilities : []
+        this._binaryBodies = capabilities.includes(CAPABILITY_BINARY_BODY)
         this._setState('online')
-        this._log('registered with the relay', { publicUrl })
+        this._log('registered with the relay', { publicUrl, binaryBodies: this._binaryBodies })
         this._resolveStartOnce(this.status())
         break
       }
@@ -831,13 +952,16 @@ export class RelayClient {
    * that prefix is stripped so the request lands on the local DSH server.
    *
    * The launch token is only injected on the device root, and only while the
-   * phone has no session cookie yet (see `hasSessionCookie`).
+   * phone holds no session cookie of the current authority (see
+   * `hasSessionCookie`). `forceToken` trades it in regardless, which is how a
+   * refused session is recovered.
    *
    * @param {string} rawPath
    * @param {Record<string, unknown>} [headers] the raw (pre-rewrite) headers
-   * @returns {{ url: string, pathname: string, query: string, isDeviceRoot: boolean }}
+   * @param {{ method?: string, forceToken?: boolean }} [options]
+   * @returns {{ url: string, pathname: string, query: string, isDeviceRoot: boolean, tokenInjected: boolean }}
    */
-  _resolveUpstream(rawPath, headers) {
+  _resolveUpstream(rawPath, headers, options = {}) {
     const { pathname, query } = splitRequestTarget(rawPath)
 
     const prefix = `/${this.deviceId}`
@@ -852,14 +976,23 @@ export class RelayClient {
     target.hash = ''
     target.pathname = `${basePath}${relative}` || '/'
 
-    let search = query
+    const method = (options.method ?? 'GET').toUpperCase()
     const isDeviceRoot = relative === '/'
-    if (isDeviceRoot && this.launchToken && !hasQueryParam(query, 'token') && !hasSessionCookie(headers)) {
-      search = appendQueryParam(query, 'token', this.launchToken)
-    }
+    // The server only mints a session cookie for `GET /?token=…`.
+    const canInject =
+      method === 'GET' &&
+      isDeviceRoot &&
+      this.launchToken.length > 0 &&
+      !hasQueryParam(query, 'token')
+    const tokenInjected =
+      canInject &&
+      (options.forceToken === true || !hasSessionCookie(headers, this.localAuthority))
+
+    let search = query
+    if (tokenInjected) search = appendQueryParam(query, 'token', this.launchToken)
     target.search = search ? `?${search}` : ''
 
-    return { url: target.href, pathname: relative, query: search, isDeviceRoot }
+    return { url: target.href, pathname: relative, query: search, isDeviceRoot, tokenInjected }
   }
 
   /**
@@ -899,17 +1032,17 @@ export class RelayClient {
     const id = String(frame.id ?? '')
     const method = String(frame.method ?? 'GET').toUpperCase()
     const headers = this._rewriteHeaders(frame.headers)
-    const { url, pathname, query } = this._resolveUpstream(
-      typeof frame.path === 'string' ? frame.path : '/',
-      frame.headers,
-    )
+    const rawPath = typeof frame.path === 'string' ? frame.path : '/'
+    const resolved = this._resolveUpstream(rawPath, frame.headers, { method })
+    const { url, pathname, query } = resolved
 
     let body = null
     if (typeof frame.body === 'string' && frame.body.length > 0) {
-      try {
-        body = Buffer.from(frame.body, 'base64')
-      } catch {
+      const encoding = frame.body_encoding
+      if (encoding === 'utf8' || encoding === 'text' || encoding === 'plain') {
         body = Buffer.from(frame.body, 'utf8')
+      } else {
+        body = Buffer.from(frame.body, 'base64')
       }
     }
 
@@ -922,21 +1055,47 @@ export class RelayClient {
     this._requests.set(id, { controller })
 
     try {
-      const response = await this._performHttpRequest({
+      let response = await this._performHttpRequest({
         method,
         url,
         headers,
         body,
         controller,
       })
-      this._sendTunnel(
-        responseFrame({
-          id,
-          status: response.status,
-          headers: response.headers,
-          body: response.body.length > 0 ? response.body.toString('base64') : null,
-        }),
-      )
+      // A phone can hold a session the server no longer accepts: the Harness
+      // app restarted on another port, or the signing secret changed. The
+      // server answers 401, and only the launch token buys a fresh cookie —
+      // without this retry the phone stays locked out for good.
+      if (response.status === 401 && !resolved.tokenInjected) {
+        const retry = this._resolveUpstream(rawPath, frame.headers, { method, forceToken: true })
+        if (retry.tokenInjected) {
+          this._log('the session cookie was refused; retrying with the launch token', {
+            id,
+            path: pathname,
+          })
+          response = await this._performHttpRequest({
+            method,
+            url: retry.url,
+            headers,
+            body,
+            controller,
+          })
+        }
+      }
+      const compressed = await compressResponse(response.status, response.headers, response.body)
+      if (this._binaryBodies && compressed.body.length > 0) {
+        // A binary message carries the body without the base64 inflation.
+        this._sendTunnelBody(id, response.status, compressed.headers, compressed.body)
+      } else {
+        this._sendTunnel(
+          responseFrame({
+            id,
+            status: response.status,
+            headers: compressed.headers,
+            body: compressed.body.length > 0 ? compressed.body.toString('base64') : null,
+          }),
+        )
+      }
       this._log('served a tunnel request', { id, method, path: pathname + query, status: response.status })
     } catch (err) {
       if (controller.signal.aborted || (err && err.name === 'AbortError')) {
@@ -1225,6 +1384,41 @@ export class RelayClient {
    */
   _sendTunnel(frame) {
     return this._send(this._sessions.tunnel?.socket, frame)
+  }
+
+  /**
+   * Send a response whose body travels as one binary WebSocket message.
+   *
+   * The text frame carries the status and the headers, the binary message the
+   * bytes. Both name the request they belong to, so the relay does not have
+   * to rely on their order.
+   *
+   * @param {string} id the request the body answers
+   * @param {number} status the upstream status
+   * @param {Record<string, unknown>} headers the upstream response headers
+   * @param {Buffer} body the raw body bytes
+   * @returns {boolean}
+   */
+  _sendTunnelBody(id, status, headers, body) {
+    const socket = this._sessions.tunnel?.socket
+    if (!socket || socket.readyState !== this._WebSocket.OPEN) return false
+    this._sendTunnel(
+      responseFrame({
+        id,
+        status,
+        headers,
+        body: null,
+        body_encoding: 'binary',
+        body_length: body.length,
+      }),
+    )
+    try {
+      socket.send(encodeBinaryBody(id, body))
+      return true
+    } catch (err) {
+      this._log('failed to send the response body', { id, error: err })
+      return false
+    }
   }
 
   /* -------------------------------------------------------------- shutdown */

@@ -35,6 +35,8 @@ import {
   MANAGEMENT_PATH,
   TUNNEL_PATH,
   abortFrame,
+  CAPABILITY_BINARY_BODY,
+  decodeBinaryBody,
   decodeFrame,
   encodeFrame,
   registerAckFrame,
@@ -824,10 +826,26 @@ export function createRelayServer(options = {}) {
         return
       }
       const list = []
+      const seen = new Set()
       for (const device of devices.values()) {
         const record = toDeviceRecord(device)
         delete record.localBaseUrl
         list.push(record)
+        seen.add(device.deviceId)
+      }
+      // The devices that are away still belong on the list, otherwise the
+      // owner could not revoke them.
+      for (const [deviceId, known] of persistedDevices) {
+        if (seen.has(deviceId)) continue
+        list.push({
+          deviceId,
+          alias: known.alias ?? '',
+          platform: known.platform ?? '',
+          clientVersion: known.clientVersion ?? '',
+          status: 'offline',
+          connectedAt: known.firstSeenAt ?? null,
+          lastSeenAt: known.lastSeenAt ?? null,
+        })
       }
       sendJson(res, 200, list)
       return
@@ -848,7 +866,44 @@ export function createRelayServer(options = {}) {
     const action = rest[1]
     const device = devices.get(deviceId)
     if (!device) {
-      sendPlain(res, 404, 'unknown device')
+      // An away device: the owner can still revoke it or rename it.
+      const known = persistedDevices.get(deviceId)
+      if (known === undefined) {
+        sendPlain(res, 404, 'unknown device')
+        return
+      }
+      if (action === 'revoke' && req.method === 'POST') {
+        const revoked = known.revoked === true ? false : true
+        known.revoked = revoked
+        persistedDevices.set(deviceId, known)
+        if (revoked) revokedDevices.add(deviceId)
+        else revokedDevices.delete(deviceId)
+        markStateDirty(device)
+        sendJson(res, 200, { ok: true })
+        return
+      }
+      if (action === 'alias' && req.method === 'POST') {
+        let payload
+        try {
+          const raw = await readBody(req, MAX_ALIAS_BYTES)
+          payload = JSON.parse(raw.toString('utf8') || '{}')
+        } catch {
+          sendPlain(res, 400, 'invalid json body')
+          return
+        }
+        const alias = String(payload?.alias ?? '').trim()
+        if (!alias || alias.length > 128) {
+          sendPlain(res, 400, 'alias must be a non-empty string of at most 128 characters')
+          return
+        }
+        known.alias = alias
+        known.aliasLocked = true
+        persistedDevices.set(deviceId, known)
+        markStateDirty(device)
+        sendJson(res, 200, { ok: true })
+        return
+      }
+      sendPlain(res, 404, 'not found')
       return
     }
 
@@ -882,6 +937,15 @@ export function createRelayServer(options = {}) {
         return
       }
       device.alias = alias
+      // The owner named it: the device may not rename it back.
+      device.aliasLocked = true
+      const known = persistedDevices.get(deviceId)
+      if (known !== undefined) {
+        known.alias = alias
+        known.aliasLocked = true
+        persistedDevices.set(deviceId, known)
+      }
+      markStateDirty(device)
       logInfo('relay: device alias updated', { deviceId })
       sendJson(res, 200, { ok: true })
       return
@@ -898,6 +962,35 @@ export function createRelayServer(options = {}) {
       return
     }
 
+    if (action === 'revoke') {
+      if (req.method !== 'POST') {
+        sendPlain(res, 405, 'method not allowed')
+        return
+      }
+      let payload
+      try {
+        const raw = await readBody(req, MAX_ALIAS_BYTES)
+        payload = JSON.parse(raw.toString('utf8') || '{}')
+      } catch {
+        sendPlain(res, 400, 'invalid json body')
+        return
+      }
+      const revoked = payload?.revoked === true
+      device.revoked = revoked
+      markStateDirty(device)
+      if (revoked) {
+        // The device is refused from now on, reconnects included.
+        closeSocket(device.managementSocket, 1000)
+        closeSocket(device.tunnelSocket, 1000)
+        device.managementSocket = null
+        device.tunnelSocket = null
+        refreshStatus(device)
+      }
+      logInfo('relay: device revoked', { deviceId, revoked })
+      sendJson(res, 200, { ok: true })
+      return
+    }
+
     sendPlain(res, 404, 'not found')
   }
 
@@ -907,7 +1000,8 @@ export function createRelayServer(options = {}) {
    * @param {any} device
    */
   function takeDeviceOffline(device) {
-    device.revoked = true
+    // A transient disconnect: the host reconnects on its own. The sticky
+    // refusal is the separate `revoke` action.
     closeSocket(device.managementSocket, 1000)
     closeSocket(device.tunnelSocket, 1000)
     device.managementSocket = null
@@ -1063,6 +1157,11 @@ export function createRelayServer(options = {}) {
     if (!path) return
     try {
       const parsed = JSON.parse(readFileSync(path, 'utf8'))
+      for (const deviceId of parsed?.revoked ?? []) revokedDevices.add(deviceId)
+      for (const [deviceId, record] of Object.entries(parsed?.devices ?? {})) {
+        if (typeof deviceId !== 'string' || deviceId.length === 0) continue
+        persistedDevices.set(deviceId, { ...record })
+      }
       for (const [deviceId, phones] of Object.entries(parsed?.phones ?? {})) {
         const list = []
         for (const phone of phones ?? []) {
@@ -1097,10 +1196,18 @@ export function createRelayServer(options = {}) {
     const path = stateFilePath()
     if (!path) return
     const phones = {}
+    // The revoked devices survive the relay restart.
+    for (const deviceId of revokedDevices) {
+      const device = devices.get(deviceId)
+      if (device !== undefined) device.revoked = true
+    }
     // The offline devices keep their phones too: the list has to survive the
     // relay restarting while a computer is away.
     for (const [deviceId, list] of persistedPhones) {
       phones[deviceId] = list.map((phone) => ({ ...phone }))
+    }
+    for (const [deviceId, device] of devices) {
+      if (device.revoked === true) revokedDevices.add(deviceId)
     }
     for (const [deviceId, device] of devices) {
       if (device.phones.size === 0) continue
@@ -1118,8 +1225,21 @@ export function createRelayServer(options = {}) {
     }
     try {
       mkdirSync(dirname(path), { recursive: true })
+      for (const [deviceId, device] of devices) {
+        const known = persistedDevices.get(deviceId) ?? {}
+        persistedDevices.set(deviceId, {
+          alias: device.alias || known.alias || '',
+          aliasLocked: device.aliasLocked === true || known.aliasLocked === true,
+          platform: device.platform || known.platform || '',
+          clientVersion: device.clientVersion || known.clientVersion || '',
+          firstSeenAt: known.firstSeenAt ?? device.connectedAt ?? new Date().toISOString(),
+          lastSeenAt: device.lastSeenAt ?? known.lastSeenAt ?? new Date().toISOString(),
+        })
+      }
+      const registry = {}
+      for (const [deviceId, record] of persistedDevices) registry[deviceId] = record
       const temporary = `${path}.tmp`
-      writeFileSync(temporary, `${JSON.stringify({ phones }, null, 2)}\n`, 'utf8')
+      writeFileSync(temporary, `${JSON.stringify({ phones, revoked: [...revokedDevices], devices: registry }, null, 2)}\n`, 'utf8')
       renameSync(temporary, path)
     } catch {
       // Persistence is best effort; the relay keeps serving without it.
@@ -1131,6 +1251,12 @@ export function createRelayServer(options = {}) {
 
   /** The phones of devices that are not registered right now. */
   const persistedPhones = new Map()
+
+  /** The devices the owner revoked; they stay refused until restored. */
+  const revokedDevices = new Set()
+
+  /** The devices the relay has seen, so an away device still shows up. */
+  const persistedDevices = new Map()
   /**
    * Note that the phone list changed and schedule a write.
    *
@@ -1756,6 +1882,14 @@ export function createRelayServer(options = {}) {
       if (!frame) return
       try {
         if (frame.type === 'register') {
+          // A revoked device is refused at the door, reconnects included.
+          const registered = frame.device_id
+          if (typeof registered === 'string' && revokedDevices.has(registered)) {
+            sendFrame(socket, registerNakFrame('this device was revoked by the owner'))
+            closeSocket(socket, 1000)
+            logInfo('relay: a revoked device tried to register', { deviceId: registered })
+            return
+          }
           device = handleRegisterFrame(socket, frame, req)
           return
         }
@@ -1826,7 +1960,11 @@ export function createRelayServer(options = {}) {
     const now = new Date().toISOString()
     const device = existing || createDeviceRecord(deviceId, now)
 
-    device.alias = typeof frame.alias === 'string' ? frame.alias : device.alias
+    // An alias the owner set is the owner's property: a device that
+    // re-registers must not take it back.
+    if (device.aliasLocked !== true) {
+      device.alias = typeof frame.alias === 'string' ? frame.alias : device.alias
+    }
     device.platform = typeof frame.platform === 'string' ? frame.platform : device.platform
     device.clientVersion =
       typeof frame.client_version === 'string' ? frame.client_version : device.clientVersion
@@ -1847,15 +1985,49 @@ export function createRelayServer(options = {}) {
     }
     device.connectedAt = now
     device.lastSeenAt = now
-    device.revoked = false
+    const known = persistedDevices.get(deviceId)
+    if (known !== undefined) {
+      if (known.aliasLocked === true) {
+        device.aliasLocked = true
+        device.alias = known.alias || device.alias
+      }
+      known.alias = device.alias || known.alias
+      known.aliasLocked = device.aliasLocked === true
+      known.platform = device.platform || known.platform
+      known.clientVersion = device.clientVersion || known.clientVersion
+      known.lastSeenAt = now
+      persistedDevices.set(deviceId, known)
+    } else {
+      persistedDevices.set(deviceId, {
+        alias: device.alias,
+        aliasLocked: device.aliasLocked === true,
+        platform: device.platform,
+        clientVersion: device.clientVersion,
+        firstSeenAt: now,
+        lastSeenAt: now,
+      })
+    }
+    // `revoked` is the owner's decision and outlives a reconnect: only the
+    // owner can lift it.
     device.managementSocket = socket
     device.registeredSeq = ++registrationCounter
     refreshStatus(device)
     devices.set(deviceId, device)
+    if (revokedDevices.has(deviceId)) device.revoked = true
     restorePhones(device)
+    // A device that has just registered belongs in the persisted registry, so
+    // it survives a relay restart and can still be revoked while it is away.
+    markStateDirty(device)
 
     const publicUrl = publicUrlFor(deviceId, resolvePublicBaseUrl(req), device.accessKey)
-    sendFrame(socket, registerAckFrame({ deviceId, publicUrl }))
+    sendFrame(
+      socket,
+      registerAckFrame({
+        deviceId,
+        publicUrl,
+        capabilities: [CAPABILITY_BINARY_BODY],
+      }),
+    )
     logInfo('relay: device registered', { deviceId, publicUrl })
     return device
   }
@@ -1888,6 +2060,7 @@ export function createRelayServer(options = {}) {
       managementSocket: null,
       tunnelSocket: null,
       revoked: false,
+      offlineRequested: false,
       mode: 'pull',
       registeredSeq: 0,
     }
@@ -1926,7 +2099,18 @@ export function createRelayServer(options = {}) {
     refreshStatus(device)
     logInfo('relay: tunnel channel opened', { deviceId })
 
-    socket.on('message', (data) => {
+    socket.on('message', (data, isBinary) => {
+      // A binary message carries the body of a response, not a frame. The
+      // flag is what tells them apart: a text frame that arrives in one
+      // piece is handed over as a Buffer, too.
+      if (isBinary === true) {
+        try {
+          handleHostBinaryBody(device, data)
+        } catch (error) {
+          logInfo('relay: binary body failed', { deviceId, error: String(error) })
+        }
+        return
+      }
       const frame = parseFrame(data)
       if (!frame) return
       try {
@@ -2028,10 +2212,55 @@ export function createRelayServer(options = {}) {
       pending.chunks = []
       return
     }
+    if (frame.body_encoding === 'binary') {
+      // The body arrives as one binary WebSocket message. The text frame
+      // carries the status and the headers, the message the bytes; both name
+      // the request, so their order does not matter.
+      pending.status = Number(frame.status) || 200
+      pending.headers = frame.headers || {}
+      pending.awaitingBinaryBody = true
+      if (pending.binaryBody !== undefined) {
+        pending.awaitingBinaryBody = false
+        pending.resolve({
+          status: pending.status,
+          headers: pending.headers || {},
+          body: pending.binaryBody,
+        })
+      }
+      return
+    }
     pending.resolve({
       status: Number(frame.status) || 200,
       headers: frame.headers || {},
       body: decodeBody(frame.body, frame.body_encoding),
+    })
+  }
+
+  /**
+   * Take the body of a response out of one binary WebSocket message.
+   *
+   * A body that travels in a binary message costs no base64 inflation, which
+   * matters on a relay that sits on the other side of the world: the web app
+   * is one bundle of several megabytes, and the link is the bottleneck.
+   *
+   * @param {any} device
+   * @param {Buffer} message the raw WebSocket message
+   */
+  function handleHostBinaryBody(device, message) {
+    const decoded = decodeBinaryBody(message)
+    if (decoded === undefined) {
+      logInfo('relay: ignoring an unreadable binary body', { deviceId: device?.deviceId })
+      return
+    }
+    const pending = inflight.get(decoded.id)
+    if (!pending) return
+    pending.binaryBody = decoded.body
+    if (pending.awaitingBinaryBody !== true) return
+    pending.awaitingBinaryBody = false
+    pending.resolve({
+      status: pending.status,
+      headers: pending.headers || {},
+      body: pending.binaryBody,
     })
   }
 

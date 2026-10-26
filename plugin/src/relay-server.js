@@ -35,6 +35,8 @@ import {
   MANAGEMENT_PATH,
   TUNNEL_PATH,
   abortFrame,
+  CAPABILITY_BINARY_BODY,
+  decodeBinaryBody,
   decodeFrame,
   encodeFrame,
   registerAckFrame,
@@ -895,6 +897,7 @@ export function createRelayServer(options = {}) {
           return
         }
         known.alias = alias
+        known.aliasLocked = true
         persistedDevices.set(deviceId, known)
         markStateDirty(device)
         sendJson(res, 200, { ok: true })
@@ -934,6 +937,15 @@ export function createRelayServer(options = {}) {
         return
       }
       device.alias = alias
+      // The owner named it: the device may not rename it back.
+      device.aliasLocked = true
+      const known = persistedDevices.get(deviceId)
+      if (known !== undefined) {
+        known.alias = alias
+        known.aliasLocked = true
+        persistedDevices.set(deviceId, known)
+      }
+      markStateDirty(device)
       logInfo('relay: device alias updated', { deviceId })
       sendJson(res, 200, { ok: true })
       return
@@ -1217,6 +1229,7 @@ export function createRelayServer(options = {}) {
         const known = persistedDevices.get(deviceId) ?? {}
         persistedDevices.set(deviceId, {
           alias: device.alias || known.alias || '',
+          aliasLocked: device.aliasLocked === true || known.aliasLocked === true,
           platform: device.platform || known.platform || '',
           clientVersion: device.clientVersion || known.clientVersion || '',
           firstSeenAt: known.firstSeenAt ?? device.connectedAt ?? new Date().toISOString(),
@@ -1947,7 +1960,11 @@ export function createRelayServer(options = {}) {
     const now = new Date().toISOString()
     const device = existing || createDeviceRecord(deviceId, now)
 
-    device.alias = typeof frame.alias === 'string' ? frame.alias : device.alias
+    // An alias the owner set is the owner's property: a device that
+    // re-registers must not take it back.
+    if (device.aliasLocked !== true) {
+      device.alias = typeof frame.alias === 'string' ? frame.alias : device.alias
+    }
     device.platform = typeof frame.platform === 'string' ? frame.platform : device.platform
     device.clientVersion =
       typeof frame.client_version === 'string' ? frame.client_version : device.clientVersion
@@ -1970,7 +1987,12 @@ export function createRelayServer(options = {}) {
     device.lastSeenAt = now
     const known = persistedDevices.get(deviceId)
     if (known !== undefined) {
+      if (known.aliasLocked === true) {
+        device.aliasLocked = true
+        device.alias = known.alias || device.alias
+      }
       known.alias = device.alias || known.alias
+      known.aliasLocked = device.aliasLocked === true
       known.platform = device.platform || known.platform
       known.clientVersion = device.clientVersion || known.clientVersion
       known.lastSeenAt = now
@@ -1978,6 +2000,7 @@ export function createRelayServer(options = {}) {
     } else {
       persistedDevices.set(deviceId, {
         alias: device.alias,
+        aliasLocked: device.aliasLocked === true,
         platform: device.platform,
         clientVersion: device.clientVersion,
         firstSeenAt: now,
@@ -1997,7 +2020,14 @@ export function createRelayServer(options = {}) {
     markStateDirty(device)
 
     const publicUrl = publicUrlFor(deviceId, resolvePublicBaseUrl(req), device.accessKey)
-    sendFrame(socket, registerAckFrame({ deviceId, publicUrl }))
+    sendFrame(
+      socket,
+      registerAckFrame({
+        deviceId,
+        publicUrl,
+        capabilities: [CAPABILITY_BINARY_BODY],
+      }),
+    )
     logInfo('relay: device registered', { deviceId, publicUrl })
     return device
   }
@@ -2069,7 +2099,18 @@ export function createRelayServer(options = {}) {
     refreshStatus(device)
     logInfo('relay: tunnel channel opened', { deviceId })
 
-    socket.on('message', (data) => {
+    socket.on('message', (data, isBinary) => {
+      // A binary message carries the body of a response, not a frame. The
+      // flag is what tells them apart: a text frame that arrives in one
+      // piece is handed over as a Buffer, too.
+      if (isBinary === true) {
+        try {
+          handleHostBinaryBody(device, data)
+        } catch (error) {
+          logInfo('relay: binary body failed', { deviceId, error: String(error) })
+        }
+        return
+      }
       const frame = parseFrame(data)
       if (!frame) return
       try {
@@ -2171,10 +2212,55 @@ export function createRelayServer(options = {}) {
       pending.chunks = []
       return
     }
+    if (frame.body_encoding === 'binary') {
+      // The body arrives as one binary WebSocket message. The text frame
+      // carries the status and the headers, the message the bytes; both name
+      // the request, so their order does not matter.
+      pending.status = Number(frame.status) || 200
+      pending.headers = frame.headers || {}
+      pending.awaitingBinaryBody = true
+      if (pending.binaryBody !== undefined) {
+        pending.awaitingBinaryBody = false
+        pending.resolve({
+          status: pending.status,
+          headers: pending.headers || {},
+          body: pending.binaryBody,
+        })
+      }
+      return
+    }
     pending.resolve({
       status: Number(frame.status) || 200,
       headers: frame.headers || {},
       body: decodeBody(frame.body, frame.body_encoding),
+    })
+  }
+
+  /**
+   * Take the body of a response out of one binary WebSocket message.
+   *
+   * A body that travels in a binary message costs no base64 inflation, which
+   * matters on a relay that sits on the other side of the world: the web app
+   * is one bundle of several megabytes, and the link is the bottleneck.
+   *
+   * @param {any} device
+   * @param {Buffer} message the raw WebSocket message
+   */
+  function handleHostBinaryBody(device, message) {
+    const decoded = decodeBinaryBody(message)
+    if (decoded === undefined) {
+      logInfo('relay: ignoring an unreadable binary body', { deviceId: device?.deviceId })
+      return
+    }
+    const pending = inflight.get(decoded.id)
+    if (!pending) return
+    pending.binaryBody = decoded.body
+    if (pending.awaitingBinaryBody !== true) return
+    pending.awaitingBinaryBody = false
+    pending.resolve({
+      status: pending.status,
+      headers: pending.headers || {},
+      body: pending.binaryBody,
     })
   }
 

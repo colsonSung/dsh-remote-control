@@ -27,7 +27,9 @@ phone ──HTTPS──▶ relay ──WebSocket──▶ host (this process)
 | tunnel | `GET /v1/remote/http?device_id=…` | the phone's HTTP requests, replayed against the local server |
 
 Frames are JSON text; bodies are base64 inside the frame, so a relay can be a
-dumb pipe. The wire contract lives in `src/relay-protocol.js`.
+dumb pipe. A relay that advertises the `binary_body` capability also accepts a
+body as one binary WebSocket message, which spares a large body the base64
+inflation. The wire contract lives in `src/relay-protocol.js`.
 
 ### Devices you can take offline, and devices you can revoke
 
@@ -78,6 +80,47 @@ everybody together.
 * The phone's traffic reaches the Harness server as an ordinary authenticated
   browser peer — the same authority, the same cookie rules, the same origin
   fence as the desktop.
+
+### The session cookie is bound to the local port
+
+The Harness server mints its browser-session cookie for one **authority**
+(`host:port`): the cookie is named `dsh-auth-<base64url(sha256(authority))>`
+and its signed payload carries the same authority. The desktop app starts the
+web server on an **ephemeral port**, so every restart of the app moves the
+authority and invalidates the cookie the phone kept.
+
+The host therefore never assumes that a cookie it sees is still good:
+
+* only the cookie of the *current* authority counts as a session — a cookie
+  from an earlier port makes the host trade the launch token in again, and the
+  server mints a fresh one;
+* a session the server nevertheless refuses (the signing secret changed) is
+  recovered by retrying the device root once with the launch token.
+
+Without both, a phone that had unlocked once would be locked out for good by
+the next restart of the app: the server would answer `401` and the host would
+have no way left to hand the phone a valid session.
+
+### The first load is heavy
+
+The web app is one JavaScript bundle of roughly 9 MB, and it travels through
+the tunnel to the relay before the relay can pass it on to the phone. Two
+things keep that affordable:
+
+* the host **compresses** every response before it enters the tunnel — the
+  bundle shrinks from 9 MB to 3.7 MB — and the phone's browser decompresses it
+  on its own;
+* a relay that advertises the `binary_body` capability also accepts a body as
+  one **binary WebSocket message**, so the body does not pay for the base64
+  inflation a JSON frame would cost it.
+
+That leaves the link itself as the bottleneck: on a 4 Mbit/s uplink the first
+load still takes about ten seconds. The browser caches the bundle by its
+revision hash, so every later load is quick, and the bundled relay on the LAN
+does not have this cost at all.
+
+An older relay that does not advertise the capability keeps working: the host
+falls back to the base64 body inside the JSON frame.
 
 ### Two relay modes
 
@@ -146,7 +189,7 @@ Settings navigation next to *General*, *Models*, *Plugins* and *Agent presets*.
 | `src/relay-server.js` | The relay: phone-facing proxy, device channels, management API |
 | `src/relay-client.js` | The host side of the tunnel |
 | `src/device-store.js` | Durable device identity and the shared secret |
-| `tests/` | 35 tests: relay unit suites plus an end-to-end tunnel test |
+| `tests/` | 54 tests: relay unit suites plus an end-to-end tunnel test |
 | `../remote-control-relay/` | The standalone relay for cloud deployments |
 
 ---
