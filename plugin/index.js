@@ -48,7 +48,7 @@ export const name = 'remote-control'
 export const ROUTE = '/api/remote-control'
 
 /** The version this plugin reports to a relay. */
-export const CLIENT_VERSION = '1.1.0'
+export const CLIENT_VERSION = '1.4.0'
 
 /** The product name a relay shows for this client. */
 export const CLIENT_NAME = 'dsh-desktop'

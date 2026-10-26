@@ -6,11 +6,764 @@
  * access URL, a copy/open pair, a security note, and a "Remote device
  * management" list — and talks to the Host over the generic Connection RPC
  * channel `/remote-control`.
+ *
+ * The file also carries the browser half of the compressed stream protocol:
+ * a WebSocket shim that inflates a compressed Remote stream payload before
+ * the app reads it. It is installed while this bundle script runs, because
+ * the app opens its stream socket before the plugin factories run.
  */
 
+/* --------------------------------------------------------------- shim start */
+
+/**
+ * The browser half of the compressed stream protocol.
+ *
+ * The Host compresses a big Remote stream payload and sends it as one
+ * binary WebSocket message that starts with the ASCII marker `DSHRC1`.
+ * The app's own stream client only reads text messages, so the phone
+ * inflates the payload before the app sees it.
+ *
+ * The shim lives in a function of its own: the file may be evaluated
+ * twice in one page, and a top level `const` would throw the second time.
+ */
+function remoteControlStreamShim() {
+  /* ------------------------------------------------- compressed stream shim */
+
+  /* contract:begin — written by tools/sync-contract.js from src/relay-protocol.js */
+  /**
+   * The marker that opens a compressed WebSocket payload.
+   *
+   * A copy of `COMPRESSED_WS_PREFIX` from `src/relay-protocol.js`: the
+   * browser half cannot import the Node-side protocol module, so the copy is
+   * generated from it (`node tools/sync-contract.js`) and checked by
+   * `tests/protocol-contract.test.js`.
+   */
+  const COMPRESSED_WS_PREFIX = 'DSHRC1'
+
+  /**
+   * The query parameter a phone adds to its stream URL to announce that it
+   * can inflate a compressed payload.
+   *
+   * A copy of `COMPRESSION_QUERY` from `src/relay-protocol.js`.
+   */
+  const COMPRESSION_QUERY = 'rcz'
+  /* contract:end */
+
+  /** The exact route the app opens for its Remote stream. */
+  const MUX_PATH = '/api/remote.mux'
+
+  /** The ASCII bytes of the marker, as the host writes them. */
+  const COMPRESSED_MARKER_BYTES = new Uint8Array(
+    Array.from(COMPRESSED_WS_PREFIX, (character) => character.charCodeAt(0)),
+  )
+
+  /**
+   * The guard that keeps a second evaluation of this file harmless.
+   *
+   * A global registry symbol: the module scope is new on every evaluation,
+   * the symbol is the same in every one of them.
+   */
+  const COMPRESSED_SOCKET_FLAG = Symbol.for('dsh.remote-control.compressed-stream-socket')
+
+  /**
+   * Where the installer is published, so the factory body can call it.
+   *
+   * A global registry symbol, for the same reason as the guard above.
+   */
+  const COMPRESSED_SOCKET_INSTALLER = Symbol.for('dsh.remote-control.compressed-stream-socket.install')
+
+  /** How long a pending payload may hold back the close event. */
+  const CLOSE_FLUSH_TIMEOUT = 10000
+
+  /**
+   * Describe one socket URL: the URL to open, and whether it is the Remote
+   * stream route.
+   *
+   * Every other socket keeps the URL it was given.
+   *
+   * @param {string | URL} url
+   * @returns {{ url: string, mux: boolean }}
+   */
+  function describeSocketUrl(url) {
+    const raw = typeof url === 'string' ? url : String(url)
+    let parsed
+    try {
+      parsed = new URL(raw)
+    } catch {
+      return { url: raw, mux: false }
+    }
+    if (!parsed.pathname.endsWith(MUX_PATH)) return { url: raw, mux: false }
+    // The announcement is a promise: this browser can inflate what the host
+    // sends. A browser without DecompressionStream keeps the payload as it
+    // is, so it must not ask for a compressed one.
+    if (!canInflatePayload()) return { url: raw, mux: true }
+    return { url: appendCompressionQuery(raw, parsed), mux: true }
+  }
+
+  /**
+   * Can this browser inflate a compressed payload?
+   *
+   * @returns {boolean}
+   */
+  function canInflatePayload() {
+    return typeof DecompressionStream === 'function'
+  }
+
+  /**
+   * Add the compression announcement to a stream URL.
+   *
+   * The URL keeps everything it carried; only the query grows, and a URL
+   * that already carries the announcement keeps it as it is.
+   *
+   * @param {string} raw the URL as it was given
+   * @param {URL} parsed the parsed URL
+   * @returns {string}
+   */
+  function appendCompressionQuery(raw, parsed) {
+    if (parsed.searchParams.has(COMPRESSION_QUERY)) return raw
+    const hashIndex = raw.indexOf('#')
+    const hash = hashIndex === -1 ? '' : raw.slice(hashIndex)
+    const withoutHash = hashIndex === -1 ? raw : raw.slice(0, hashIndex)
+    const queryIndex = withoutHash.indexOf('?')
+    const path = queryIndex === -1 ? withoutHash : withoutHash.slice(0, queryIndex)
+    const query = queryIndex === -1 ? '' : withoutHash.slice(queryIndex + 1)
+    const announcement = `${COMPRESSION_QUERY}=1`
+    const next = query.length === 0 ? announcement : `${query}&${announcement}`
+    return `${path}?${next}${hash}`
+  }
+
+  /**
+   * The bytes of one binary message.
+   *
+   * @param {unknown} data the raw event data
+   * @returns {Promise<Uint8Array | undefined>} undefined when the data is not binary
+   */
+  async function binaryBytes(data) {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data)
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+    if (typeof Blob !== 'undefined' && data instanceof Blob) {
+      return new Uint8Array(await data.arrayBuffer())
+    }
+    return undefined
+  }
+
+  /**
+   * Does this payload carry the compressed marker?
+   *
+   * @param {Uint8Array} bytes
+   * @returns {boolean}
+   */
+  function hasCompressedMarker(bytes) {
+    if (bytes.length < COMPRESSED_MARKER_BYTES.length) return false
+    for (let index = 0; index < COMPRESSED_MARKER_BYTES.length; index += 1) {
+      if (bytes[index] !== COMPRESSED_MARKER_BYTES[index]) return false
+    }
+    return true
+  }
+
+  /**
+   * Inflate one gzip payload into text.
+   *
+   * @param {Uint8Array} bytes the gzip bytes
+   * @returns {Promise<string>}
+   */
+  async function inflateGzip(bytes) {
+    if (typeof DecompressionStream !== 'function') {
+      throw new Error('this browser cannot inflate a compressed payload')
+    }
+    const stream = new DecompressionStream('gzip')
+    const writer = stream.writable.getWriter()
+    const writing = (async () => {
+      await writer.write(bytes)
+      await writer.close()
+    })()
+    const reading = (async () => {
+      const reader = stream.readable.getReader()
+      const chunks = []
+      for (;;) {
+        const result = await reader.read()
+        if (result.done) break
+        chunks.push(result.value)
+      }
+      return chunks
+    })()
+    // Both sides run at the same time: the write only finishes when the
+    // read drains the stream.
+    writing.catch(() => undefined)
+    reading.catch(() => undefined)
+    const [, chunks] = await Promise.all([writing, reading])
+    let length = 0
+    for (const chunk of chunks) length += chunk.length
+    const out = new Uint8Array(length)
+    let offset = 0
+    for (const chunk of chunks) {
+      out.set(chunk, offset)
+      offset += chunk.length
+    }
+    return new TextDecoder('utf-8').decode(out)
+  }
+
+  /**
+   * Is this byte part of a base64 alphabet?
+   *
+   * @param {number} byte
+   * @returns {boolean}
+   */
+  function isBase64Byte(byte) {
+    if (byte >= 0x41 && byte <= 0x5a) return true
+    if (byte >= 0x61 && byte <= 0x7a) return true
+    if (byte >= 0x30 && byte <= 0x39) return true
+    return byte === 0x2b || byte === 0x2f
+  }
+
+  /**
+   * Read ASCII bytes as a string.
+   *
+   * The conversion runs in chunks: a payload of a few hundred kilobytes
+   * would blow the argument limit of a single call.
+   *
+   * @param {Uint8Array} bytes
+   * @returns {string}
+   */
+  function binaryBytesToString(bytes) {
+    let text = ''
+    const chunk = 8192
+    for (let offset = 0; offset < bytes.length; offset += chunk) {
+      text += String.fromCharCode.apply(null, bytes.subarray(offset, offset + chunk))
+    }
+    return text
+  }
+
+  /**
+   * Decode one base64 payload into bytes.
+   *
+   * @param {Uint8Array} bytes the ASCII base64 text
+   * @returns {Uint8Array}
+   */
+  function base64ToBytes(bytes) {
+    const text = binaryBytesToString(bytes)
+    if (typeof Uint8Array.fromBase64 === 'function') return Uint8Array.fromBase64(text)
+    const binary = atob(text)
+    const out = new Uint8Array(binary.length)
+    for (let index = 0; index < binary.length; index += 1) {
+      out[index] = binary.charCodeAt(index)
+    }
+    return out
+  }
+
+  /**
+   * The base64 fallback of an older relay.
+   *
+   * A relay that guesses the encoding of a frame hands the phone the base64
+   * *text* of a binary payload instead of the bytes, because gzip bytes are
+   * not valid UTF-8. The phone decodes the text and inflates it.
+   *
+   * The guess stays strict: a payload that is not base64, that does not
+   * carry the marker, or that does not inflate, is none of our business and
+   * is delivered as it came.
+   *
+   * @param {Uint8Array} bytes
+   * @returns {Promise<string | undefined>}
+   */
+  async function decodeBase64Payload(bytes) {
+    if (bytes.length === 0 || bytes.length % 4 !== 0) return undefined
+    for (let index = 0; index < bytes.length; index += 1) {
+      const byte = bytes[index]
+      // The padding may only sit at the very end.
+      if (byte === 0x3d && index >= bytes.length - 2) continue
+      if (!isBase64Byte(byte)) return undefined
+    }
+    let decoded
+    try {
+      decoded = base64ToBytes(bytes)
+    } catch {
+      return undefined
+    }
+    if (!hasCompressedMarker(decoded)) return undefined
+    try {
+      return await inflateGzip(decoded.subarray(COMPRESSED_MARKER_BYTES.length))
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Decode one socket payload.
+   *
+   * @param {unknown} data the raw event data
+   * @returns {Promise<{ passThrough: true } | { text: string } | undefined>} undefined drops the message
+   */
+  async function decodeSocketPayload(data) {
+    if (typeof data === 'string') return { passThrough: true }
+    const bytes = await binaryBytes(data)
+    if (bytes === undefined) return { passThrough: true }
+    if (hasCompressedMarker(bytes)) {
+      try {
+        return { text: await inflateGzip(bytes.subarray(COMPRESSED_MARKER_BYTES.length)) }
+      } catch (error) {
+        console.warn('[remote-control] failed to inflate a compressed stream payload', error)
+        return undefined
+      }
+    }
+    const text = await decodeBase64Payload(bytes)
+    if (text === undefined) return { passThrough: true }
+    return { text }
+  }
+
+  /**
+   * The same event, carrying the decoded text.
+   *
+   * The original event is reused when the browser allows it: it keeps the
+   * origin, the timestamp and the target the browser set on it.
+   *
+   * @param {MessageEvent} event
+   * @param {string} text
+   * @returns {MessageEvent}
+   */
+  function withEventData(event, text) {
+    try {
+      Object.defineProperty(event, 'data', { value: text, configurable: true, enumerable: true, writable: true })
+      return event
+    } catch {
+      return new MessageEvent('message', {
+        data: text,
+        origin: event.origin,
+        lastEventId: event.lastEventId,
+        source: event.source,
+        ports: event.ports,
+      })
+    }
+  }
+
+  /**
+   * Install the shim that inflates a compressed stream payload.
+   *
+   * The guard on `window` keeps a second call harmless: the file may be
+   * evaluated twice in one page, and the shim may only be installed once.
+   *
+   * @returns {void}
+   */
+  function installCompressedStreamSocket() {
+    if (window[COMPRESSED_SOCKET_FLAG] === true) return
+    const OriginalWebSocket = window.WebSocket
+    if (typeof OriginalWebSocket !== 'function') return
+
+    /**
+     * One WebSocket that can inflate a compressed stream payload.
+     *
+     * Every socket behaves exactly like the native one. Only the Remote
+     * stream route changes: it announces that it can inflate a compressed
+     * payload, and it turns a compressed binary message back into the text
+     * the app expects.
+     */
+    class CompressedStreamSocket extends OriginalWebSocket {
+      /**
+       * @param {string | URL} url
+       * @param {string | string[]} [protocols]
+       */
+      constructor(url, protocols) {
+        const target = describeSocketUrl(url)
+        super(target.url, protocols)
+        /** Whether this socket carries the Remote stream. @type {boolean} */
+        this._rcMux = target.mux
+        /** The listeners of this socket, by event type. @type {Map<string, object[]>} */
+        this._rcListeners = new Map()
+        /** The delivery chain: one link per message that waits. @type {Promise<void>} */
+        this._rcChain = Promise.resolve()
+        /** How many messages wait for their turn. @type {number} */
+        this._rcPending = 0
+        /** The `onmessage` handler of this socket. @type {Function | null} */
+        this._rcOnMessage = null
+        /** The `onclose` handler of this socket. @type {Function | null} */
+        this._rcOnClose = null
+        /** The close event, waiting for the pending payloads. @type {CloseEvent | undefined} */
+        this._rcCloseEvent = undefined
+        /** The guard that delivers the close event once. @type {boolean} */
+        this._rcCloseFlushed = false
+        /** The timer that releases the close event. @type {any} */
+        this._rcCloseTimer = undefined
+        if (target.mux !== true) return
+        // A compressed payload is binary, and the marker has to be readable
+        // from its first bytes.
+        this.binaryType = 'arraybuffer'
+        super.addEventListener('message', (event) => { this._rcReceive(event) })
+        super.addEventListener('close', (event) => { this._rcClosed(event) })
+      }
+
+      /**
+       * Register a listener.
+       *
+       * @param {string} type
+       * @param {EventListenerOrEventListenerObject | null} listener
+       * @param {boolean | AddEventListenerOptions} [options]
+       * @returns {void}
+       */
+      addEventListener(type, listener, options) {
+        if (this._rcMux === true && (type === 'message' || type === 'close')) {
+          this._rcAdd(type, listener, options)
+          return
+        }
+        super.addEventListener(type, listener, options)
+      }
+
+      /**
+       * Remove a listener.
+       *
+       * @param {string} type
+       * @param {EventListenerOrEventListenerObject | null} listener
+       * @param {boolean | EventListenerOptions} [options]
+       * @returns {void}
+       */
+      removeEventListener(type, listener, options) {
+        if (this._rcMux === true && (type === 'message' || type === 'close')) {
+          this._rcRemove(type, listener, options)
+          return
+        }
+        super.removeEventListener(type, listener, options)
+      }
+
+      /** @returns {Function | null} */
+      get onmessage() {
+        if (this._rcMux === true) return this._rcOnMessage
+        return super.onmessage
+      }
+
+      /** @param {Function | null} value */
+      set onmessage(value) {
+        if (this._rcMux === true) {
+          this._rcOnMessage = typeof value === 'function' ? value : null
+          return
+        }
+        super.onmessage = value
+      }
+
+      /** @returns {Function | null} */
+      get onclose() {
+        if (this._rcMux === true) return this._rcOnClose
+        return super.onclose
+      }
+
+      /** @param {Function | null} value */
+      set onclose(value) {
+        if (this._rcMux === true) {
+          this._rcOnClose = typeof value === 'function' ? value : null
+          return
+        }
+        super.onclose = value
+      }
+
+      /**
+       * Add one listener of a rewritten event type.
+       *
+       * @param {string} type
+       * @param {EventListenerOrEventListenerObject | null} listener
+       * @param {boolean | AddEventListenerOptions} [options]
+       * @returns {void}
+       */
+      _rcAdd(type, listener, options) {
+        if (listener === null || listener === undefined) return
+        const capture = typeof options === 'boolean' ? options : options?.capture === true
+        const once = options?.once === true
+        const signal = options?.signal
+        const entries = this._rcEntries(type)
+        // The DOM ignores a second registration of the same listener for
+        // the same capture flag.
+        if (entries.some((entry) => entry.listener === listener && entry.capture === capture)) return
+        entries.push({ type, listener, capture, once })
+        this._rcListeners.set(type, entries)
+        if (signal === undefined || signal === null) return
+        if (signal.aborted === true) {
+          this._rcRemove(type, listener, capture)
+          return
+        }
+        signal.addEventListener('abort', () => { this._rcRemove(type, listener, capture) }, { once: true })
+      }
+
+      /**
+       * Remove one listener of a rewritten event type.
+       *
+       * @param {string} type
+       * @param {EventListenerOrEventListenerObject | null} listener
+       * @param {boolean | EventListenerOptions} [options]
+       * @returns {void}
+       */
+      _rcRemove(type, listener, options) {
+        const capture = typeof options === 'boolean' ? options : options?.capture === true
+        const entries = this._rcListeners.get(type)
+        if (entries === undefined) return
+        const index = entries.findIndex((entry) => entry.listener === listener && entry.capture === capture)
+        if (index === -1) return
+        entries.splice(index, 1)
+      }
+
+      /**
+       * The listeners of one event type.
+       *
+       * @param {string} type
+       * @returns {object[]}
+       */
+      _rcEntries(type) {
+        const entries = this._rcListeners.get(type)
+        return entries === undefined ? [] : [...entries]
+      }
+
+      /**
+       * Call one listener.
+       *
+       * @param {object} entry
+       * @param {Event} event
+       * @returns {void}
+       */
+      _rcInvoke(entry, event) {
+        if (entry.once === true) this._rcRemove(entry.type, entry.listener, entry.capture)
+        const listener = entry.listener
+        if (typeof listener === 'function') {
+          listener.call(this, event)
+          return
+        }
+        if (typeof listener?.handleEvent === 'function') listener.handleEvent(event)
+      }
+
+      /**
+       * Handle one native message event.
+       *
+       * @param {MessageEvent} event
+       * @returns {void}
+       */
+      _rcReceive(event) {
+        // A text message needs no work, and the common case stays
+        // synchronous: the app reads the frame right away.
+        if (typeof event.data === 'string' && this._rcPending === 0) {
+          this._rcDeliver(event)
+          return
+        }
+        this._rcEnqueue(event)
+      }
+
+      /**
+       * Put one message behind the ones that wait for their turn.
+       *
+       * @param {MessageEvent} event
+       * @returns {void}
+       */
+      _rcEnqueue(event) {
+        this._rcPending += 1
+        this._rcChain = this._rcChain
+          .then(() => this._rcProcess(event))
+          .catch((error) => {
+            console.warn('[remote-control] failed to read a stream payload', error)
+          })
+          .then(() => {
+            this._rcPending -= 1
+          })
+      }
+
+      /**
+       * Decode one message and hand it to the listeners.
+       *
+       * @param {MessageEvent} event
+       * @returns {Promise<void>}
+       */
+      async _rcProcess(event) {
+        const decoded = await decodeSocketPayload(event.data)
+        if (decoded === undefined) return
+        if (decoded.passThrough === true) {
+          this._rcDeliver(event)
+          return
+        }
+        this._rcDeliver(event, decoded.text)
+      }
+
+      /**
+       * Hand one message to the listeners of this socket.
+       *
+       * @param {MessageEvent} event
+       * @param {string} [text] the decoded text; the event keeps its own data when omitted
+       * @returns {void}
+       */
+      _rcDeliver(event, text) {
+        const delivery = text === undefined ? event : withEventData(event, text)
+        for (const entry of this._rcEntries('message')) {
+          this._rcInvoke(entry, delivery)
+        }
+        if (this._rcOnMessage !== null) this._rcOnMessage.call(this, delivery)
+      }
+
+      /**
+       * Handle the native close event.
+       *
+       * The close waits for the payloads that are still on their way: the
+       * browser delivers every message it received before the close, and
+       * the app reads its last frame there.
+       *
+       * @param {CloseEvent} event
+       * @returns {void}
+       */
+      _rcClosed(event) {
+        this._rcCloseEvent = event
+        const flush = () => { this._rcFlushClose() }
+        this._rcChain.then(flush, flush)
+        // A payload that never arrives must not keep the close hostage.
+        this._rcCloseTimer = window.setTimeout(flush, CLOSE_FLUSH_TIMEOUT)
+      }
+
+      /**
+       * Deliver the close event to the listeners of this socket.
+       *
+       * @returns {void}
+       */
+      _rcFlushClose() {
+        if (this._rcCloseFlushed === true) return
+        this._rcCloseFlushed = true
+        if (this._rcCloseTimer !== undefined) {
+          window.clearTimeout(this._rcCloseTimer)
+          this._rcCloseTimer = undefined
+        }
+        const event = this._rcCloseEvent
+        if (event === undefined) return
+        for (const entry of this._rcEntries('close')) {
+          this._rcInvoke(entry, event)
+        }
+        if (this._rcOnClose !== null) this._rcOnClose.call(this, event)
+      }
+    }
+
+    window[COMPRESSED_SOCKET_FLAG] = true
+    window.WebSocket = CompressedStreamSocket
+  }
+
+  // The shim has to be in place before the app opens its stream socket.
+  //
+  // The client module loader runs a plugin bundle in two steps: executing the
+  // bundle script only REGISTERS the factory, and the factory runs later, when
+  // the entry is materialized. The stream socket is opened while the app's own
+  // modules are materialized, so a shim installed from the factory alone can be
+  // too late. Installing it here, at the moment the bundle script executes, is
+  // early enough: the loader fetches and runs the bundle of every plugin that
+  // declares `dsh.client.immediately` before it materializes any entry, and
+  // this plugin declares it.
+  //
+  // The factory body calls the installer as well; the guard on `window` makes
+  // that second call a no-op.
+  window[COMPRESSED_SOCKET_INSTALLER] = installCompressedStreamSocket
+  installCompressedStreamSocket()
+}
+
+remoteControlStreamShim()
+
+/* ---------------------------------------------------------------- shim end */
+
+/* -------------------------------------------------------------- layout */
+
+/**
+ * The mobile layout of the sidebar.
+ *
+ * Below 1024px the app keeps the expanded sidebar as a column beside the
+ * conversation, which leaves the conversation a sliver: on a 393px phone the
+ * sidebar takes 280px and the conversation the remaining 113px. On a phone an
+ * expanded sidebar covers the whole screen instead - the frame gives the
+ * sidebar every pixel and the conversation goes behind it, where the sidebar's
+ * own collapse control brings it back.
+ *
+ * The rule is written against the shell's own attributes
+ * (`data-shell-overlay` and `data-sidebar-collapsed`), not against the
+ * build's hashed class names, so it survives a release. If the frame ever
+ * changes shape, the selector simply stops matching and the app keeps its own
+ * layout.
+ *
+ * @returns {void}
+ */
+function installMobileSidebarLayout() {
+  if (typeof document === 'undefined' || document.head === null) return
+  const id = 'dsh-remote-control-mobile-layout'
+  if (document.getElementById(id) !== null) return
+  const style = document.createElement('style')
+  style.id = id
+  style.textContent = [
+    '@media (max-width: 1023px) {',
+    '  /* The expanded sidebar takes the whole screen: the frame gives it every',
+    '     pixel and the conversation goes behind it. */',
+    '  :has(> [data-shell-overlay]):not([data-sidebar-collapsed]) {',
+    '    grid-template-columns: 100% 0 0 !important;',
+    '  }',
+    '  /* The drawer is the whole screen now: its resize handle has nothing',
+    '     to resize and would sit in the middle of the phone. */',
+    '  :has(> [data-shell-overlay]):not([data-sidebar-collapsed]) > [data-side="sidebar"] {',
+    '    display: none !important;',
+    '  }',
+    '  /* The shell\'s own open and collapse controls are 28px glyphs in a',
+    '     corner. On a phone they get a visible surface and a bigger touch',
+    '     target - without moving, so the control next to them keeps its',
+    '     place. */',
+    '  [data-dsh-sidebar-toggle] {',
+    '    position: relative !important;',
+    '    background: var(--dsw-alias-interactive-bg-hover) !important;',
+    '    border-radius: var(--dsw-radius-md) !important;',
+    '  }',
+    '  [data-dsh-sidebar-toggle]::after {',
+    '    content: "";',
+    '    position: absolute;',
+    '    inset: -8px;',
+    '  }',
+    '}',
+  ].join('\n')
+  document.head.appendChild(style)
+}
+
+// The layout rule is independent of the shim: it only needs the document.
+installMobileSidebarLayout()
+
+/** Where the control marker is published, so a test can drive it. */
+const SIDEBAR_CONTROL_MARKER = Symbol.for('dsh.remote-control.mark-sidebar-controls')
+
+/**
+ * Mark the shell's own sidebar controls on a phone.
+ *
+ * The shell has both controls already - the panel icon in the expanded
+ * sidebar's top strip and the brand mark in the collapsed rail - but on a
+ * phone they are 28px glyphs in a corner, which is easy to walk past. The
+ * rules below make them unmistakable there and leave the desktop alone.
+ *
+ * The buttons are found by the accessible name the shell gives them, so no
+ * build-hashed class name is involved.
+ *
+ * @param {string} collapseLabel the shell's label for the collapse control
+ * @param {string} openLabel the shell's label for the open control
+ * @returns {void}
+ */
+function markSidebarControls(collapseLabel, openLabel) {
+  if (typeof document === 'undefined') return
+  const narrow = window.matchMedia('(max-width: 1023px)').matches
+  // The shell may append the shortcut to the name, so a prefix counts too -
+  // but only the name itself, so the right sidebar's own button is not caught.
+  const is = (label, expected) => label === expected || label.startsWith(`${expected} `)
+  for (const element of document.querySelectorAll('button[aria-label]')) {
+    const label = element.getAttribute('aria-label') ?? ''
+    if (is(label, collapseLabel)) element.setAttribute('data-dsh-sidebar-toggle', 'collapse')
+    else if (is(label, openLabel)) element.setAttribute('data-dsh-sidebar-toggle', 'open')
+    else if (element.hasAttribute('data-dsh-sidebar-toggle')) {
+      element.removeAttribute('data-dsh-sidebar-toggle')
+    }
+  }
+  // The rules are phone-only, so the markers are only worth keeping there.
+  if (!narrow) {
+    for (const element of document.querySelectorAll('[data-dsh-sidebar-toggle]')) {
+      element.removeAttribute('data-dsh-sidebar-toggle')
+    }
+  }
+}
+
+window[SIDEBAR_CONTROL_MARKER] = markSidebarControls
+
 window.__ModuleLoader__.load({
-  id: '@local/remote-control',
+  id: 'dsh-remote-control',
   factory(require) {
+    // The shim was installed while this bundle script ran, which is early
+    // enough: the app opens its stream socket only after the client module
+    // loader has loaded every plugin module. The call below keeps the
+    // guarantee inside the factory as well; the guard makes it a no-op.
+    window[Symbol.for('dsh.remote-control.compressed-stream-socket.install')]?.()
+
     const React = require('react')
     const h = React.createElement
 
@@ -782,6 +1535,27 @@ window.__ModuleLoader__.load({
             return () => {}
           }
         }, 'remote-control: dictionaries')
+        // On a phone the shell's own open and collapse controls get a real
+        // target. They are re-rendered by the shell, so the marks are
+        // refreshed on a short tick - the same cadence the sidebar's own
+        // anchor uses.
+        ctx.effect(() => {
+          let labels = null
+          try {
+            const sidebar = ctx.locale.bind('sidebar')
+            labels = { collapse: sidebar('toggle.collapse'), open: sidebar('toggle.open') }
+          } catch (error) {
+            // The shell's namespace is not there yet; the tick tries again.
+            labels = null
+          }
+          const mark = () => {
+            if (labels === null) return
+            markSidebarControls(labels.collapse, labels.open)
+          }
+          mark()
+          const timer = setInterval(mark, 750)
+          return () => clearInterval(timer)
+        }, 'remote-control: sidebar controls')
         const t = ctx.locale.bind(NS)
         ctx.effect(() => ctx.slots.inject('settings.section', () => {
           try {

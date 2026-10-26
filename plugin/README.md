@@ -27,9 +27,75 @@ phone ──HTTPS──▶ relay ──WebSocket──▶ host (this process)
 | tunnel | `GET /v1/remote/http?device_id=…` | the phone's HTTP requests, replayed against the local server |
 
 Frames are JSON text; bodies are base64 inside the frame, so a relay can be a
-dumb pipe. A relay that advertises the `binary_body` capability also accepts a
-body as one binary WebSocket message, which spares a large body the base64
-inflation. The wire contract lives in `src/relay-protocol.js`.
+dumb pipe. The wire contract lives in `src/relay-protocol.js`.
+
+Two capabilities let a relay take the bytes as they are instead of paying for
+the base64 inflation, and both are optional — the host only uses them when the
+relay advertises them, so an older relay keeps working:
+
+| Capability | What it buys |
+| --- | --- |
+| `binary_body` | the body of an HTTP response travels as one binary message |
+| `ws_binary_body` | the payload of a WebSocket travels as one binary message |
+
+### The big payloads are compressed
+
+Opening a conversation on the phone pulls one snapshot of that session: on a
+busy session that is megabytes of JSON, and the tunnel of a remote relay is
+exactly where the bytes are scarce. The same payload crosses the link twice
+(host to relay, relay to phone), so the host gzips it and marks it.
+
+The phone announces that it can inflate such a payload by adding `rcz=1` to
+the query of its stream URL. The host takes that parameter out again before
+the request reaches the DSH server, and only compresses when the phone asked
+for it — a phone that does not know the parameter keeps receiving the payload
+as it is. On a session with 2.8 MB of history the snapshot shrinks to about
+480 KB, which is the difference between four seconds of "Loading history…" and
+a fraction of one.
+
+### An event stream survives the tunnel
+
+`/plugins/events` is an event stream: it never ends, and the phone waits for
+the next event. A tunnel that waits for the whole body before answering turns
+that into a `504` after thirty seconds, so the host sends the head first and
+the body in chunks, and the relay hands every chunk to the phone as it
+arrives. The relay keeps such a request alive with an idle window of five
+minutes — an event stream says nothing between its events, and the window that
+guards a request would cut it while it is perfectly fine.
+
+### The sidebar takes the whole screen on a phone
+
+Below 1024px the app keeps the expanded sidebar as a column beside the
+conversation, which leaves the conversation a sliver: on a 393px phone the
+sidebar takes 280px and the conversation the remaining 113px. The browser half
+therefore gives the sidebar every pixel while it is expanded, and the
+conversation goes behind it — the sidebar's own collapse control brings it
+back.
+
+The rule is written against the shell's own attributes
+(`data-shell-overlay`, `data-sidebar-collapsed`, `data-side="sidebar"`), not
+against the build's hashed class names, so it survives a release. If the frame
+ever changes shape, the selector stops matching and the app keeps its own
+layout.
+
+### The sidebar's own controls are unmistakable on a phone
+
+The shell has both controls already - the panel icon in the expanded
+sidebar's top strip and the brand mark in the collapsed rail - but on a
+phone they are 28px glyphs in a corner, which is easy to walk past. The
+browser half finds them by the accessible name the shell gives them (no
+build-hashed class name) and gives them a visible surface and a bigger touch
+target. Their size and place do not change, so the control next to them
+keeps its own position.
+
+### A refused session is recovered
+
+The Harness app binds its browser-session cookie to one authority, and the
+desktop app moves that authority on every restart. The cookie the phone kept
+is then worth nothing, and the phone would sit on an empty screen until it
+reloaded the page. The host therefore trades its launch token in for a fresh
+cookie when the local server refuses the handshake, and opens the stream
+again — the phone never notices.
 
 ### Devices you can take offline, and devices you can revoke
 
@@ -41,6 +107,13 @@ up and can still be managed:
 * **Revoke access** — refuses the device at the door, reconnects included, until
   you press *Restore access*. The refusal is persisted, so it survives a relay
   restart.
+
+### A restart of the relay does not lock the phones out
+
+The session cookie the relay hands a phone is derived from the relay's secret
+and the phone's own credential, not random: a relay that restarts (a deploy, a
+crash, a reboot) can recompute it. Before, every restart threw the sessions
+away, and the app answered `401` until the phone typed the access code again.
 
 ### Trusted devices
 
@@ -184,13 +257,31 @@ Settings navigation next to *General*, *Models*, *Plugins* and *Agent presets*.
 | Path | Role |
 | --- | --- |
 | `index.js` | Host half: relay lifecycle, the `/api/remote-control` route, QR generation |
-| `client.js` | Client half: the *Remote Control* settings section |
+| `client.js` | Client half: the *Remote Control* settings section, and the browser half of the compressed stream protocol |
 | `src/relay-protocol.js` | The wire contract shared by host and relay |
 | `src/relay-server.js` | The relay: phone-facing proxy, device channels, management API |
 | `src/relay-client.js` | The host side of the tunnel |
 | `src/device-store.js` | Durable device identity and the shared secret |
-| `tests/` | 54 tests: relay unit suites plus an end-to-end tunnel test |
+| `tools/sync-contract.js` | Writes the wire contract into the browser half and checks it |
+| `tests/` | The test suites: relay unit suites, the tunnel end to end, the compression path |
 | `../remote-control-relay/` | The standalone relay for cloud deployments |
+
+### The contract exists on both sides
+
+The browser half runs in the page and cannot import `src/relay-protocol.js`,
+so the two values it needs — the marker that opens a compressed payload and
+the query parameter that announces the support — exist on both sides. The
+copy in `client.js` is **generated**:
+
+```
+node tools/sync-contract.js          # write the current contract into client.js
+node tools/sync-contract.js --check  # fail when client.js is out of date
+```
+
+`tests/protocol-contract.test.js` runs the check, so a constant that drifts
+fails the suite instead of quietly turning into a phone that waits for the
+full megabytes.
+
 
 ---
 

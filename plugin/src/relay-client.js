@@ -51,11 +51,17 @@ import {
   bearerHeader,
   bearerSubprotocol,
   CAPABILITY_BINARY_BODY,
+  CAPABILITY_WS_BINARY_BODY,
+  COMPRESSED_WS_PREFIX,
+  COMPRESSION_QUERY,
+  chunkedResponseFrame,
   decodeFrame,
   encodeBinaryBody,
+  encodeBinaryWsPayload,
   encodeFrame,
   managementUrl,
   registerFrame,
+  responseChunkFrame,
   responseFrame,
   tunnelUrl,
   upgradedFrame,
@@ -113,6 +119,15 @@ const DROPPED_RESPONSE_HEADERS = new Set(['connection', 'transfer-encoding'])
 const MIN_COMPRESSED_BYTES = 4 * 1024
 
 /**
+ * The smallest WebSocket payload that is worth compressing.
+ *
+ * A stream frame is one JSON message: the small ones (a cursor, a
+ * notification) are cheap to send as they are, while a session snapshot is
+ * megabytes. The line between the two is where the transfer starts to hurt.
+ */
+const MIN_COMPRESSED_WS_BYTES = 8 * 1024
+
+/**
  * The content types that gain from compression.
  *
  * Images, fonts and archives are already compressed; compressing them again
@@ -120,6 +135,25 @@ const MIN_COMPRESSED_BYTES = 4 * 1024
  */
 const COMPRESSIBLE_CONTENT_TYPES =
   /^(?:text\/|application\/(?:javascript|json|xml|manifest\+json)|image\/svg\+xml)/i
+
+/**
+ * The content type of a response whose body never ends.
+ *
+ * The plugin event stream is a Server-Sent Events endpoint: the phone opens
+ * it and the events arrive as they happen. A body that never ends cannot be
+ * waited for, so it travels in chunks instead of in one buffered frame.
+ */
+const EVENT_STREAM_CONTENT_TYPE = 'text/event-stream'
+
+/**
+ * The size of one chunk of a streamed response.
+ *
+ * One frame must never carry an unbounded buffer: the relay would have to
+ * hold it in memory, and a frame that cannot be written without waiting for
+ * the whole body defeats the purpose of streaming. 64 KiB keeps the tunnel
+ * busy while the frame overhead stays in the noise.
+ */
+const STREAM_CHUNK_BYTES = 64 * 1024
 
 /** The gzip implementation, as a promise. */
 const gzipAsync = promisify(gzip)
@@ -307,6 +341,38 @@ function hasQueryParam(query, name) {
 }
 
 /**
+ * Read one query parameter's value.
+ *
+ * @param {string} query the raw query string
+ * @param {string} name the parameter to read
+ * @returns {string | undefined} the decoded value, or undefined when absent
+ */
+function queryParamValue(query, name) {
+  if (!query) return undefined
+  const wanted = name.toLowerCase()
+  for (const part of query.split('&')) {
+    if (!part) continue
+    const eq = part.indexOf('=')
+    const rawKey = eq === -1 ? part : part.slice(0, eq)
+    let key = rawKey.replace(/\+/g, ' ')
+    try {
+      key = decodeURIComponent(key)
+    } catch {
+      /* keep the raw key when it is not valid percent-encoding */
+    }
+    if (key.toLowerCase() !== wanted) continue
+    if (eq === -1) return ''
+    const rawValue = part.slice(eq + 1).replace(/\+/g, ' ')
+    try {
+      return decodeURIComponent(rawValue)
+    } catch {
+      return rawValue
+    }
+  }
+  return undefined
+}
+
+/**
  * Append one query parameter, preserving every existing one.
  * @param {string} query
  * @param {string} name
@@ -319,6 +385,56 @@ function appendQueryParam(query, name, value) {
 }
 
 /**
+ * Remove one query parameter, preserving every other one.
+ *
+ * The phone announces its compression support in the query of its stream
+ * URL. That parameter is ours, not the DSH server's, so it must not reach
+ * the local server.
+ *
+ * @param {string} query the raw query string
+ * @param {string} name the parameter to drop
+ * @returns {string}
+ */
+function removeQueryParam(query, name) {
+  if (!query) return ''
+  const wanted = name.toLowerCase()
+  const kept = []
+  for (const part of query.split('&')) {
+    if (!part) continue
+    const eq = part.indexOf('=')
+    const rawKey = eq === -1 ? part : part.slice(0, eq)
+    let key = rawKey.replace(/\+/g, ' ')
+    try {
+      key = decodeURIComponent(key)
+    } catch {
+      /* keep the raw key when it is not valid percent-encoding */
+    }
+    if (key.toLowerCase() === wanted) continue
+    kept.push(part)
+  }
+  return kept.join('&')
+}
+
+/**
+ * Split the compression announcement out of an upgrade path.
+ *
+ * A phone that can inflate a compressed payload adds the `rcz` parameter to
+ * the query of its stream URL. The parameter is ours, so it is taken out
+ * before the path reaches the local DSH server.
+ *
+ * @param {string} rawPath the path the relay forwarded
+ * @returns {{ path: string, compress: boolean }}
+ */
+function splitCompressionQuery(rawPath) {
+  const { pathname, query } = splitRequestTarget(rawPath)
+  // The value decides, not the presence: a phone that sends `rcz=0` asks for
+  // the payload as it is.
+  if (queryParamValue(query, COMPRESSION_QUERY) !== '1') return { path: rawPath, compress: false }
+  const rest = removeQueryParam(query, COMPRESSION_QUERY)
+  return { path: rest ? `${pathname}?${rest}` : pathname, compress: true }
+}
+
+/**
  * Normalise a header value to the string form Node's http client expects.
  * @param {unknown} value
  * @returns {string}
@@ -327,6 +443,23 @@ function headerValue(value) {
   if (Array.isArray(value)) return value.join(', ')
   if (value === undefined || value === null) return ''
   return String(value)
+}
+
+/**
+ * Does the response head describe an event stream?
+ *
+ * The content type is compared case-insensitively and without its
+ * parameters, so `Text/Event-Stream; charset=utf-8` is recognised as well.
+ *
+ * @param {Record<string, unknown>} headers the upstream response headers
+ * @returns {boolean}
+ */
+function isEventStreamResponse(headers) {
+  const type = String(headers?.['content-type'] ?? '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase()
+  return type === EVENT_STREAM_CONTENT_TYPE
 }
 
 /**
@@ -441,6 +574,8 @@ export class RelayClient {
     this._registered = false
     /** @type {boolean} whether the relay accepts a body as a binary message */
     this._binaryBodies = false
+    /** @type {boolean} whether the relay accepts a ws payload as a binary message */
+    this._binaryWsPayloads = false
     /** @type {boolean} */
     this._stopped = true
 
@@ -876,8 +1011,16 @@ export class RelayClient {
         // inflation on every response; an older one keeps the JSON frame.
         const capabilities = Array.isArray(frame.capabilities) ? frame.capabilities : []
         this._binaryBodies = capabilities.includes(CAPABILITY_BINARY_BODY)
+        // The same for a WebSocket payload: the biggest one of all — a
+        // session snapshot — pays for no base64 when it travels as a binary
+        // message. An older relay keeps the JSON frame.
+        this._binaryWsPayloads = capabilities.includes(CAPABILITY_WS_BINARY_BODY)
         this._setState('online')
-        this._log('registered with the relay', { publicUrl, binaryBodies: this._binaryBodies })
+        this._log('registered with the relay', {
+          publicUrl,
+          binaryBodies: this._binaryBodies,
+          binaryWsPayloads: this._binaryWsPayloads,
+        })
         this._resolveStartOnce(this.status())
         break
       }
@@ -988,8 +1131,10 @@ export class RelayClient {
       canInject &&
       (options.forceToken === true || !hasSessionCookie(headers, this.localAuthority))
 
-    let search = query
-    if (tokenInjected) search = appendQueryParam(query, 'token', this.launchToken)
+    // The compression announcement is ours, not the DSH server's: it never
+    // reaches the local server, on any path.
+    let search = removeQueryParam(query, COMPRESSION_QUERY)
+    if (tokenInjected) search = appendQueryParam(search, 'token', this.launchToken)
     target.search = search ? `?${search}` : ''
 
     return { url: target.href, pathname: relative, query: search, isDeviceRoot, tokenInjected }
@@ -1055,7 +1200,7 @@ export class RelayClient {
     this._requests.set(id, { controller })
 
     try {
-      let response = await this._performHttpRequest({
+      let opened = await this._openHttpRequest({
         method,
         url,
         headers,
@@ -1066,14 +1211,16 @@ export class RelayClient {
       // app restarted on another port, or the signing secret changed. The
       // server answers 401, and only the launch token buys a fresh cookie —
       // without this retry the phone stays locked out for good.
-      if (response.status === 401 && !resolved.tokenInjected) {
+      if (opened.status === 401 && !resolved.tokenInjected) {
         const retry = this._resolveUpstream(rawPath, frame.headers, { method, forceToken: true })
         if (retry.tokenInjected) {
           this._log('the session cookie was refused; retrying with the launch token', {
             id,
             path: pathname,
           })
-          response = await this._performHttpRequest({
+          // The refused body is of no use: it is dropped, not read.
+          opened.response.resume()
+          opened = await this._openHttpRequest({
             method,
             url: retry.url,
             headers,
@@ -1081,6 +1228,21 @@ export class RelayClient {
             controller,
           })
         }
+      }
+
+      // An event stream never ends: the head goes out first and the body
+      // follows in chunks, so the relay does not time the request out and
+      // the phone gets the events instead of a 504.
+      if (isEventStreamResponse(opened.rawHeaders)) {
+        await this._streamResponse(id, opened, controller, pathname)
+        return
+      }
+
+      const buffer = await this._readResponseBody(opened.response)
+      const response = {
+        status: opened.status,
+        headers: this._normalizeResponseHeaders(opened.rawHeaders, buffer.length),
+        body: buffer,
       }
       const compressed = await compressResponse(response.status, response.headers, response.body)
       if (this._binaryBodies && compressed.body.length > 0) {
@@ -1117,11 +1279,16 @@ export class RelayClient {
   }
 
   /**
-   * Perform the actual upstream HTTP request.
+   * Start the upstream HTTP request and hand back its head.
+   *
+   * The head arrives before the body, and what happens with the body depends
+   * on it: an event stream never ends, so it has to be forwarded while it
+   * runs instead of being waited for.
+   *
    * @param {{ method: string, url: string, headers: Record<string, string>, body: Buffer|null, controller: AbortController }} options
-   * @returns {Promise<{ status: number, headers: Record<string, unknown>, body: Buffer }>}
+   * @returns {Promise<{ status: number, rawHeaders: Record<string, unknown>, response: import('node:http').IncomingMessage }>}
    */
-  _performHttpRequest({ method, url, headers, body, controller }) {
+  _openHttpRequest({ method, url, headers, body, controller }) {
     return new Promise((resolve, reject) => {
       const target = new URL(url)
       const secure = target.protocol === 'https:'
@@ -1137,23 +1304,104 @@ export class RelayClient {
           signal: controller.signal,
         },
         (res) => {
-          const chunks = []
-          res.on('data', (chunk) => chunks.push(chunk))
-          res.on('end', () => {
-            const buffer = Buffer.concat(chunks)
-            resolve({
-              status: res.statusCode ?? 502,
-              headers: this._normalizeResponseHeaders(res.headers, buffer.length),
-              body: buffer,
-            })
+          resolve({
+            status: res.statusCode ?? 502,
+            rawHeaders: res.headers,
+            response: res,
           })
-          res.on('error', reject)
         },
       )
       request.on('error', reject)
       if (body && body.length > 0) request.write(body)
       request.end()
     })
+  }
+
+  /**
+   * Read the whole body of one upstream response.
+   *
+   * @param {import('node:http').IncomingMessage} response
+   * @returns {Promise<Buffer>}
+   */
+  _readResponseBody(response) {
+    return new Promise((resolve, reject) => {
+      const chunks = []
+      response.on('data', (chunk) => chunks.push(chunk))
+      response.on('end', () => resolve(Buffer.concat(chunks)))
+      response.on('error', reject)
+    })
+  }
+
+  /**
+   * Forward one event stream to the relay, chunk by chunk.
+   *
+   * A stream that never ends cannot be waited for: the relay would time the
+   * request out and the phone would get a 504 instead of the events. The head
+   * goes out first, the body follows in chunks, and the last chunk closes
+   * the response on the relay's side.
+   *
+   * The head carries neither a length (it is unknown) nor an encoding (the
+   * host does not compress a streamed body).
+   *
+   * @param {string} id the request this stream answers
+   * @param {{ status: number, rawHeaders: Record<string, unknown>, response: import('node:http').IncomingMessage }} opened the upstream response
+   * @param {AbortController} controller aborts the upstream request
+   * @param {string} pathname the upstream path (for the log)
+   */
+  async _streamResponse(id, opened, controller, pathname) {
+    const headers = this._normalizeResponseHeaders(opened.rawHeaders, 0)
+    // The length of a streamed body is unknown.
+    delete headers['content-length']
+    // The host does not compress a streamed body, so the head must not claim
+    // an encoding. An encoding the upstream applied itself is kept: the
+    // phone inflates the stream on its own, and dropping the header would
+    // show garbage.
+    const encoding = String(headers['content-encoding'] ?? '')
+    if (encoding && encoding.toLowerCase() !== 'identity') {
+      this._log('the upstream event stream is encoded', { id, path: pathname, encoding })
+    } else {
+      delete headers['content-encoding']
+    }
+
+    this._sendTunnel(
+      chunkedResponseFrame({
+        id,
+        status: opened.status,
+        headers,
+      }),
+    )
+    this._log('streaming a tunnel response', { id, path: pathname, status: opened.status })
+
+    let closed = false
+    const close = () => {
+      if (closed) return
+      closed = true
+      this._sendTunnel(responseChunkFrame({ id, chunk: '', last: true }))
+    }
+
+    try {
+      for await (const chunk of opened.response) {
+        // An aborted request must not send another chunk.
+        if (controller.signal.aborted) break
+        // One frame never carries more than one bounded piece of the body.
+        for (let at = 0; at < chunk.length; at += STREAM_CHUNK_BYTES) {
+          if (controller.signal.aborted) break
+          const piece = chunk.subarray(at, Math.min(at + STREAM_CHUNK_BYTES, chunk.length))
+          this._sendTunnel(
+            responseChunkFrame({ id, chunk: piece.toString('base64'), last: false }),
+          )
+        }
+      }
+    } catch (err) {
+      // A stream that dies must not leave the phone hanging: the last chunk
+      // closes the response on the relay's side as well.
+      if (controller.signal.aborted || (err && err.name === 'AbortError')) {
+        this._log('the relay aborted the event stream', { id, path: pathname })
+      } else {
+        this._log('the event stream failed', { id, path: pathname, error: err })
+      }
+    }
+    close()
   }
 
   /**
@@ -1203,12 +1451,34 @@ export class RelayClient {
     const protocols = parseSubprotocols(headers['sec-websocket-protocol'])
     delete headers['sec-websocket-protocol']
 
-    const { url, pathname } = this._resolveUpstream(
+    // The phone announces that it can inflate a compressed payload in the
+    // query of its stream URL. That parameter is ours: it must not reach
+    // the local server.
+    const upgrade = splitCompressionQuery(
       typeof frame.path === 'string' ? frame.path : '/',
+    )
+
+    const { url, pathname } = this._resolveUpstream(
+      upgrade.path,
       frame.headers,
     )
     const target = toWsUrl(url)
 
+    this._openLocalBridge(id, target, protocols, headers, upgrade, pathname, 0)
+  }
+
+  /**
+   * Open the local WebSocket of one phone bridge.
+   *
+   * @param {string} id the bridge this socket belongs to
+   * @param {string} target the local WebSocket URL
+   * @param {string[]} protocols the subprotocols the phone offered
+   * @param {Record<string, string>} headers the headers for the local server
+   * @param {{ path: string, compress: boolean }} upgrade the upgrade the relay asked for
+   * @param {string} pathname the local path, for the log
+   * @param {number} attempt how often the upgrade has been tried
+   */
+  _openLocalBridge(id, target, protocols, headers, upgrade, pathname, attempt) {
     /** @type {any} */
     let local
     try {
@@ -1223,7 +1493,7 @@ export class RelayClient {
       return
     }
 
-    const bridge = { local, pending: [] }
+    const bridge = { local, pending: [], compress: upgrade.compress, chain: Promise.resolve(), failed: false }
     this._bridges.set(id, bridge)
 
     local.on('open', () => {
@@ -1236,7 +1506,13 @@ export class RelayClient {
 
     local.on('message', (data, isBinary) => {
       const payload = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8')
-      this._sendTunnel(wsFrame({ id, data: payload.toString('base64'), binary: isBinary === true }))
+      // The frames of one stream are ordered, and a compressed frame takes a
+      // moment to build: the queue keeps the order the peer protocol needs.
+      bridge.chain = bridge.chain
+        .then(() => this._sendBridgePayload(bridge, id, payload, isBinary === true))
+        .catch((err) => {
+          this._log('failed to forward a websocket payload', { id, error: err })
+        })
     })
 
     // The Harness host pings its browser and drops a socket that stays
@@ -1258,15 +1534,91 @@ export class RelayClient {
 
     local.on('error', (err) => {
       this._log('the local websocket failed', { id, error: err })
-      if (local.readyState !== this._WebSocket.OPEN) this._sendUpgradeFailure(id)
+      if (local.readyState !== this._WebSocket.OPEN) this._sendUpgradeFailure(id, bridge)
+    })
+
+    // The server answers a handshake it refuses with a status instead of
+    // switching protocols. A 401 means the session cookie the phone holds is
+    // no longer good: the app restarted and the authority moved with it. The
+    // host mints a fresh one and tries once more, so the phone does not have
+    // to reload the page to get its stream back.
+    local.on('unexpected-response', (_request, response) => {
+      const status = Number(response?.statusCode ?? 0)
+      if (status === 401 && attempt === 0) {
+        void this._retryUpgradeWithFreshCookie(id, target, protocols, headers, upgrade, pathname)
+        return
+      }
+      this._log('the local websocket was refused', { id, status })
+      this._sendUpgradeFailure(id, bridge)
     })
   }
 
   /**
-   * Tell the relay that the local WebSocket could not be established.
-   * @param {string} id
+   * Mint a fresh browser session cookie and open the bridge with it.
+   *
+   * The launch token is the host's own credential: the server answers the
+   * device root with it and mints a cookie for the current authority. The
+   * cookie never travels to the phone - only the fresh stream does.
+   *
+   * @param {string} id the bridge this socket belongs to
+   * @param {string} target the local WebSocket URL
+   * @param {string[]} protocols the subprotocols the phone offered
+   * @param {Record<string, string>} headers the headers for the local server
+   * @param {{ path: string, compress: boolean }} upgrade the upgrade the relay asked for
+   * @param {string} pathname the local path, for the log
    */
-  _sendUpgradeFailure(id) {
+  async _retryUpgradeWithFreshCookie(id, target, protocols, headers, upgrade, pathname) {
+    this._log('the phone session was refused; minting a fresh cookie', { id, path: pathname })
+    const cookie = await this._mintSessionCookie()
+    if (cookie === null) {
+      this._sendUpgradeFailure(id)
+      return
+    }
+    this._bridges.delete(id)
+    this._openLocalBridge(id, target, protocols, { ...headers, cookie }, upgrade, pathname, 1)
+  }
+
+  /**
+   * Mint a browser session cookie for the local server.
+   *
+   * @returns {Promise<string | null>} the `name=value` pair, or null
+   */
+  async _mintSessionCookie() {
+    if (this.launchToken.length === 0) return null
+    const controller = new AbortController()
+    try {
+      const resolved = this._resolveUpstream('/', {}, { method: 'GET', forceToken: true })
+      const opened = await this._openHttpRequest({
+        method: 'GET',
+        url: resolved.url,
+        headers: { host: this.localAuthority, accept: '*/*' },
+        body: null,
+        controller,
+      })
+      opened.response.resume()
+      const raw = opened.rawHeaders['set-cookie']
+      const list = Array.isArray(raw) ? raw : raw === undefined ? [] : [raw]
+      for (const entry of list) {
+        const pair = String(entry).split(';')[0].trim()
+        if (pair.startsWith('dsh-auth-')) return pair
+      }
+      this._log('the server minted no session cookie', { status: opened.status })
+      return null
+    } catch (err) {
+      this._log('failed to mint a session cookie', { error: err })
+      return null
+    }
+  }
+
+  /**
+   * Tell the relay that the local WebSocket could not be established.
+   *
+   * @param {string} id
+   * @param {{ failed?: boolean }} [bridge] the bridge, so the failure is sent once
+   */
+  _sendUpgradeFailure(id, bridge) {
+    if (bridge?.failed === true) return
+    if (bridge !== undefined) bridge.failed = true
     this._sendTunnel(
       responseFrame({
         id,
@@ -1275,6 +1627,70 @@ export class RelayClient {
         body: Buffer.from('bad gateway', 'utf8').toString('base64'),
       }),
     )
+  }
+
+  /**
+   * Forward one WebSocket payload to the phone.
+   *
+   * A big payload is compressed: the tunnel of a remote relay is where the
+   * bytes are scarce, and the same payload crosses the link twice (host to
+   * relay, relay to phone). The phone asked for this with the `rcz`
+   * parameter, so it knows how to inflate the payload.
+   *
+   * A relay that takes a WebSocket payload as a binary tunnel message gets
+   * the bytes as they are: the base64 inflation of a JSON frame costs a third
+   * more bytes on the link that is the bottleneck, and the biggest payload
+   * of all — a session snapshot — is megabytes.
+   *
+   * @param {{ local: any, pending: any[], compress: boolean }} bridge
+   * @param {string} id the bridge this payload belongs to
+   * @param {Buffer} payload the raw payload
+   * @param {boolean} isBinary whether the local socket delivered it as binary
+   */
+  async _sendBridgePayload(bridge, id, payload, isBinary) {
+    if (bridge.compress && payload.length >= MIN_COMPRESSED_WS_BYTES) {
+      const compressed = await this._compressWsPayload(payload)
+      if (compressed !== payload) {
+        // A compressed payload travels as one binary message: the relay
+        // forwards it as it is, and the phone inflates it before the peer
+        // protocol on it sees the bytes.
+        if (this._binaryWsPayloads) {
+          this._sendTunnelBinary(encodeBinaryWsPayload(id, compressed, true))
+          return
+        }
+        this._sendTunnel(wsFrame({ id, data: compressed.toString('base64'), binary: true }))
+        return
+      }
+    }
+    if (this._binaryWsPayloads) {
+      // The kind of the payload travels with it: a text frame must stay text
+      // on the other side, or the peer protocol on it breaks.
+      this._sendTunnelBinary(encodeBinaryWsPayload(id, payload, isBinary))
+      return
+    }
+    this._sendTunnel(wsFrame({ id, data: payload.toString('base64'), binary: isBinary }))
+  }
+
+  /**
+   * Compress one WebSocket payload.
+   *
+   * The compressed payload starts with the marker the phone looks for. A
+   * payload that does not get smaller is returned unchanged, so the caller
+   * falls back to sending it as it is.
+   *
+   * @param {Buffer} payload the raw payload
+   * @returns {Promise<Buffer>}
+   */
+  async _compressWsPayload(payload) {
+    const prefix = Buffer.from(COMPRESSED_WS_PREFIX, 'latin1')
+    try {
+      const body = await gzipAsync(payload, { level: 6 })
+      if (body.length + prefix.length >= payload.length) return payload
+      return Buffer.concat([prefix, body])
+    } catch (err) {
+      this._log('failed to compress a websocket payload', { error: err })
+      return payload
+    }
   }
 
   /**
@@ -1384,6 +1800,29 @@ export class RelayClient {
    */
   _sendTunnel(frame) {
     return this._send(this._sessions.tunnel?.socket, frame)
+  }
+
+  /**
+   * Send one binary message on the tunnel channel.
+   *
+   * A payload that travels as a binary message pays for no base64 inflation,
+   * which matters on a link where the bytes are scarce: the WebSocket
+   * payload of a session snapshot is megabytes, and the base64 of a JSON
+   * frame is a third more.
+   *
+   * @param {Buffer} message the raw message
+   * @returns {boolean}
+   */
+  _sendTunnelBinary(message) {
+    const socket = this._sessions.tunnel?.socket
+    if (!socket || socket.readyState !== this._WebSocket.OPEN) return false
+    try {
+      socket.send(message)
+      return true
+    } catch (err) {
+      this._log('failed to send a binary message', { error: err })
+      return false
+    }
   }
 
   /**

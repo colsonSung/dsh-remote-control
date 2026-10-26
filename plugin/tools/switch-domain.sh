@@ -2,7 +2,7 @@
 #
 # Switch the remote-control relay to your own domain, end to end.
 #
-#   ./tools/switch-domain.sh rc.example.com
+#   ./tools/switch-domain.sh rc.hyacinthml.cn
 #
 # 1. waits until the hostname resolves to this machine's public address,
 # 2. asks the server to issue the certificate, rewrite nginx, and point the
