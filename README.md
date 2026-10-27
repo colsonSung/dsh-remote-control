@@ -30,21 +30,21 @@ second, stripped-down mobile UI to build, and none to keep in step.
 The sidebar is a drawer that covers the screen, the way a phone menu does:
 
 ```
-┌─ 390px phone ─────────────────┐
-│ ☰  deepseek HARNESS        ☀ ◧ │  ← the brand and the theme switch
-│                               │
-│ ＋ New Session                │  ← the same button as on the desktop
-│                               │
-│  ⚙ Plugins                    │
-│  ⏱ Automation tasks           │  ← the global panels
-│  📖 English Reader            │
-│                               │
-│  Workspaces            🔍 ⚙  ＋│
-│  📁 default-workspace          │
-│    ○ New Session              │
-│    ○ a session of your agent   │  ← tap it: the session opens
-│    ○ another session           │     and the drawer closes
-└───────────────────────────────┘
+┌─ 390px phone ───────────────────────────┐
+│  deepseek HARNESS                        │
+│                                         │
+│  + New Session                          │  ← the same button as on the desktop
+│                                         │
+│  · Plugins                              │
+│  · Automation tasks                     │  ← the global panels
+│  · English Reader                       │
+│                                         │
+│  Workspaces                    search  + │
+│  ▸ default-workspace                    │
+│    ○ New Session                        │
+│    ○ a session of your agent             │  ← tap it: the session opens
+│    ○ another session                     │     and the drawer closes
+└─────────────────────────────────────────┘
 ```
 
 Nothing is a mock-up of the desktop: it is the desktop app, on a screen that
