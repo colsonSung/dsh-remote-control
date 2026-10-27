@@ -73,6 +73,18 @@ const PHONE_COOKIE_MAX_AGE = 180 * 24 * 60 * 60
 /** How long a trusted phone's session cookie lives. */
 const PHONE_SESSION_MAX_AGE = 24 * 60 * 60
 
+/**
+ * The `SameSite` of the phone's cookies.
+ *
+ * `Lax`, not `Strict`: the link is opened from somewhere else — a chat, a QR
+ * scanner, a mail — and a `Strict` cookie is not sent on such a top level
+ * navigation. The phone would arrive without its credential, be asked for
+ * the access code again, and land in the owner's device list as a new
+ * handset every single time. `Lax` still keeps the cookie away from cross
+ * site POSTs, and the relay's own state changing routes are POSTs.
+ */
+const PHONE_COOKIE_SAME_SITE = 'Lax'
+
 /** Failed passcode attempts before the relay locks a device out. */
 const PASSCODE_MAX_ATTEMPTS = 5
 
@@ -1369,6 +1381,38 @@ export function createRelayServer(options = {}) {
   }
 
   /**
+   * The phone whose record matches a caller that lost its credential.
+   *
+   * A phone that arrives without its cookie — a browser that cleared it, a
+   * web view with its own storage, a private tab — would otherwise be a new
+   * device on every visit, and the owner's list would fill up with one
+   * handset. The caller address and the User-Agent together name the same
+   * device well enough to continue its record.
+   *
+   * A trusted record is never handed out this way: the trust belongs to the
+   * phone that proved itself with its own credential, not to whoever shares
+   * its address. Such a caller gets a record of its own, and still has to
+   * type the access code.
+   *
+   * @param {any} device
+   * @param {import('node:http').IncomingMessage} req
+   * @returns {any | undefined}
+   */
+  function matchingPhone(device, req) {
+    const ip = callerAddress(req)
+    const userAgent = String(req.headers['user-agent'] ?? '')
+    if (ip === '' || userAgent === '') return undefined
+    let best
+    for (const phone of device.phones.values()) {
+      if (phone.trusted === true) continue
+      if (phone.lastIp !== ip) continue
+      if (phone.userAgent !== userAgent) continue
+      if (best === undefined || (phone.lastSeenAt ?? '') > (best.lastSeenAt ?? '')) best = phone
+    }
+    return best
+  }
+
+  /**
    * Remember a phone after it unlocked, and hand it its own credential.
    *
    * @param {any} device
@@ -1376,7 +1420,7 @@ export function createRelayServer(options = {}) {
    * @returns {{ token: string, record: any }}
    */
   function rememberPhone(device, req) {
-    const existing = phoneOfRequest(device, req)
+    const existing = phoneOfRequest(device, req) ?? matchingPhone(device, req)
     const token = existing?.token ?? randomBytes(32).toString('base64url')
     const userAgent = String(req.headers['user-agent'] ?? '')
     const record = existing ?? {
@@ -1606,8 +1650,8 @@ export function createRelayServer(options = {}) {
     res.writeHead(303, {
       location: url.pathname,
       'set-cookie': [
-        `${PHONE_SESSION_COOKIE}=${session}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${PHONE_SESSION_MAX_AGE}`,
-        `${PHONE_DEVICE_COOKIE}=${phone.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${PHONE_COOKIE_MAX_AGE}`,
+        `${PHONE_SESSION_COOKIE}=${session}; Path=/; HttpOnly; SameSite=${PHONE_COOKIE_SAME_SITE}; Max-Age=${PHONE_SESSION_MAX_AGE}`,
+        `${PHONE_DEVICE_COOKIE}=${phone.token}; Path=/; HttpOnly; SameSite=${PHONE_COOKIE_SAME_SITE}; Max-Age=${PHONE_COOKIE_MAX_AGE}`,
       ],
       'cache-control': 'no-store',
     })

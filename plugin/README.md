@@ -148,6 +148,23 @@ file, so they survive a relay restart.
 A phone that is only *known* still has to type the access code; untrusting a
 phone takes effect at its next visit.
 
+### One phone is one record
+
+The credential has to survive the way a phone is actually opened: the link
+comes from a chat, a QR scanner or a mail, so the first request after it is a
+navigation from another site. A `SameSite=Strict` cookie is not sent on such a
+navigation, so the phone arrived without its credential, was asked for the
+access code again, and landed in **Devices that connected** as a new handset
+every single visit. The cookie is `SameSite=Lax` now: it travels with the
+link, and still stays away from cross-site POSTs.
+
+A phone that arrives without its credential anyway — a browser that cleared
+it, a private tab, a web view with its own storage — continues the record of
+the same caller (its address and its User-Agent) instead of starting a new
+one. **A trusted record is never continued that way**: the trust belongs to the
+phone that proved itself, so a caller without the credential gets a record of
+its own and still has to type the access code.
+
 ### Two factors: the link and the access code
 
 The link is only half the credential. A device registers an **access key** (122

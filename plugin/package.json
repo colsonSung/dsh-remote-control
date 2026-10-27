@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-control",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "private": true,
   "type": "module",
   "description": "Remote Control — drive this DeepSeek Harness agent from your phone through a Kimi-Code-style relay tunnel.",

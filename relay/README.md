@@ -200,6 +200,23 @@ A phone that unlocks once keeps a credential of its own (`dsh-device`, 180
 days) and shows up in the device list. The owner marks a phone as **trusted**,
 and from then on it skips the access code.
 
+## One phone is one record
+
+The credential has to survive the way a phone is really opened: the link comes
+from a chat, a QR scanner or a mail, so the first request after it is a
+navigation from another site. A `SameSite=Strict` cookie is not sent on such a
+navigation — the phone arrived without its credential, was asked for the access
+code again, and every visit added another row to the device list. The cookie
+is `SameSite=Lax` now: it travels with the link, and still stays away from
+cross-site POSTs.
+
+A phone that arrives without its credential anyway — a cleared cookie, a
+private tab, a web view with its own storage — continues the record of the same
+caller (its address and its User-Agent). **A trusted record is never continued
+that way**: the trust belongs to the phone that proved itself, so a caller
+without the credential gets a record of its own and still has to type the access
+code.
+
 ## A restart does not lock the phones out
 
 The session cookie a phone gets after it types the access code is **derived**,
