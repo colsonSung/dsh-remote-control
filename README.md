@@ -29,6 +29,16 @@ second, stripped-down mobile UI to build, and none to keep in step.
 
 The sidebar is a drawer that covers the screen, the way a phone menu does:
 
+<p align="center">
+  <video src="docs/demo.mp4" poster="docs/demo-poster.png" width="320" controls playsinline></video>
+</p>
+
+The clip is the real app in a 390×664 window: the drawer opens over the
+conversation, **one tap** opens the session and closes the drawer, and the
+answer streams in while the phone is still in your hand. It was recorded
+against a throw-away profile with one seeded conversation — no session, no
+plugin and no account of the author's is in it.
+
 ```
 ┌─ 390px phone ───────────────────────────┐
 │  deepseek HARNESS                        │
