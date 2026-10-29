@@ -145,7 +145,15 @@ const MAX_ALIAS_BYTES = 4 * 1024
 /** Largest accepted proxied request body. */
 const MAX_BODY_BYTES = 64 * 1024 * 1024
 
-/** Accepted shape of a device id (kept path-safe on purpose). */
+/** How often the relay checks that a device is still there. */
+const LIVENESS_INTERVAL_MS = 20_000
+
+/** How long a device may be quiet before the relay drops its channels. */
+const LIVENESS_TIMEOUT_MS = 60_000
+
+/**
+ * Accepted shape of a device id (kept path-safe on purpose).
+ */
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/
 
 /** Reason texts used in `register_nak` frames. */
@@ -359,6 +367,8 @@ export function createRelayServer(options = {}) {
     statePath: rawStatePath,
     requestTimeoutMs: rawRequestTimeoutMs,
     streamIdleTimeoutMs: rawStreamIdleTimeoutMs,
+    livenessTimeoutMs: rawLivenessTimeoutMs,
+    livenessIntervalMs: rawLivenessIntervalMs,
   } = options || {}
 
   if (typeof token !== 'string' || token.trim() === '') {
@@ -571,6 +581,90 @@ export function createRelayServer(options = {}) {
       /* ignore */
     }
   }
+
+  /**
+   * Note every sign of life from one device channel.
+   *
+   * @param {WebSocket} socket - the channel.
+   * @param {any} device - the device the channel belongs to.
+   * @returns {void}
+   */
+  function watchLiveness(socket, device) {
+    const alive = () => {
+      touchDevice(device)
+    }
+    socket.on('pong', alive)
+    socket.on('ping', alive)
+    socket.on('message', alive)
+  }
+
+  /**
+   * Remember that a device is still there.
+   *
+   * A socket that goes quiet without closing — a dropped network, a sleeping
+   * laptop, a NAT that forgets the flow — stays `OPEN` on the relay for ever.
+   * The relay would then keep the device registered and refuse every new
+   * registration of the same device ("device already registered"), so the
+   * computer could never come back. Any traffic at all proves the peer is
+   * there, and the relay's own ping provokes exactly that.
+   *
+   * @param {any} device - the device the socket belongs to.
+   * @returns {void}
+   */
+  function touchDevice(device) {
+    if (device === undefined || device === null) return
+    device.lastHeardAt = Date.now()
+  }
+
+  /**
+   * Drop the channels of every device that stopped answering.
+   *
+   * A device that missed the window is gone: its sockets are terminated, the
+   * close handler clears the registration, and the device may register again.
+   *
+   * @returns {void}
+   */
+  function sweepLiveness() {
+    const now = Date.now()
+    for (const device of devices.values()) {
+      // A device that is away has no channels, and nothing to drop.
+      if (device.managementSocket === null && device.tunnelSocket === null) continue
+      const lastHeard = device.lastHeardAt ?? 0
+      if (now - lastHeard <= livenessTimeoutMs) {
+        // The device is still there: ask it, so that a quiet but alive peer
+        // keeps proving itself.
+        for (const socket of [device.managementSocket, device.tunnelSocket]) {
+          if (socket === null || socket === undefined || socket.readyState !== WebSocket.OPEN) continue
+          try {
+            socket.ping()
+          } catch {
+            /* ignore */
+          }
+        }
+        continue
+      }
+      logInfo('relay: device went silent, dropping its channels', { deviceId: device.deviceId })
+      for (const socket of [device.managementSocket, device.tunnelSocket]) {
+        if (socket === null || socket === undefined) continue
+        try {
+          socket.terminate()
+        } catch {
+          /* ignore */
+        }
+      }
+      device.managementSocket = null
+      device.tunnelSocket = null
+      refreshStatus(device)
+    }
+  }
+
+  /** The liveness sweep, started with the server. */
+  let livenessTimer = null
+
+  /** How long a device may be quiet before its channels are dropped. */
+  const livenessTimeoutMs = rawLivenessTimeoutMs ?? LIVENESS_TIMEOUT_MS
+  /** How often the relay looks at the devices. */
+  const livenessIntervalMs = rawLivenessIntervalMs ?? LIVENESS_INTERVAL_MS
 
   /* ------------------------------------------------------------ ws helpers */
 
@@ -2239,6 +2333,8 @@ export function createRelayServer(options = {}) {
     }
     // `revoked` is the owner's decision and outlives a reconnect: only the
     // owner can lift it.
+    watchLiveness(socket, device)
+    touchDevice(device)
     device.managementSocket = socket
     device.registeredSeq = ++registrationCounter
     refreshStatus(device)
@@ -2287,6 +2383,8 @@ export function createRelayServer(options = {}) {
       status: 'offline',
       connectedAt: now,
       lastSeenAt: now,
+      /** When the relay last heard from the device, in epoch ms. */
+      lastHeardAt: Date.now(),
       managementSocket: null,
       tunnelSocket: null,
       revoked: false,
@@ -2324,6 +2422,7 @@ export function createRelayServer(options = {}) {
     if (device.tunnelSocket && device.tunnelSocket !== socket) {
       closeSocket(device.tunnelSocket, 1000)
     }
+    watchLiveness(socket, device)
     device.tunnelSocket = socket
     device.lastSeenAt = now
     refreshStatus(device)
@@ -3058,6 +3157,13 @@ export function createRelayServer(options = {}) {
     server = httpServer
     wss = websocketServer
 
+    // A device that stopped answering must not keep its registration: the
+    // relay would refuse the computer that comes back.
+    if (livenessTimer === null) {
+      livenessTimer = setInterval(sweepLiveness, livenessIntervalMs)
+      livenessTimer.unref?.()
+    }
+
     return new Promise((resolve, reject) => {
       const onError = (error) => {
         httpServer.off('listening', onListening)
@@ -3116,6 +3222,10 @@ export function createRelayServer(options = {}) {
   function close() {
     if (closePromise) return closePromise
     closing = true
+    if (livenessTimer !== null) {
+      clearInterval(livenessTimer)
+      livenessTimer = null
+    }
     // Flush a pending write: the phone list must not be lost because the relay
     // was stopped inside the debounce window.
     if (persistTimer !== undefined) {

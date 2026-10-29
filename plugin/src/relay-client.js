@@ -73,6 +73,9 @@ import {
 
 /* ------------------------------------------------------------------ tuning */
 
+/** The relay's answer when it still holds a registration of this device. */
+const DUPLICATE_REASON = /already registered/i
+
 /** @type {Record<string, number>} */
 const DEFAULT_OPTIONS = {
   /** First reconnect delay; doubles on every failed attempt. */
@@ -1032,6 +1035,21 @@ export class RelayClient {
         this._log('the relay refused the device', { reason })
         this._rejectStartOnce(new Error(`relay-client: ${reason}`))
         this._setState('error', reason)
+        if (DUPLICATE_REASON.test(reason)) {
+          // A duplicate registration is transient: the relay may still be
+          // holding the registration of a connection that is already gone — a
+          // dropped network leaves such a socket open on the relay, and it
+          // refuses this device until the relay notices. The client keeps
+          // trying, so the computer comes back on its own once the relay
+          // lets go of the stale registration.
+          this._log('the relay still holds this device; retrying')
+          try {
+            session.socket?.terminate()
+          } catch {
+            /* ignore */
+          }
+          break
+        }
         void this._shutdown(reason, 'error')
         break
       }

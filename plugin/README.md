@@ -130,6 +130,26 @@ up and can still be managed:
   you press *Restore access*. The refusal is persisted, so it survives a relay
   restart.
 
+### A device that went quiet comes back on its own
+
+The relay keeps the registration of a device while its channel is open. A
+channel that goes quiet without closing — a dropped network, a sleeping
+laptop, a NAT that forgets the flow — stays open on the relay, and the relay
+then refuses every new registration of that device ("device already
+registered"). The computer could not come back at all: the owner saw the
+device as offline and the tunnel stayed dead.
+
+Two things prevent that now:
+
+- the relay remembers when it last heard from a device and drops the channels
+  of the ones that went quiet, so a stale registration cannot outlive the
+  connection it belongs to;
+- the host keeps retrying after such a refusal, so the device is back as soon
+  as the relay lets go — no restart of the app needed.
+
+A device that is really there keeps its place: a second registration of the
+same id is still refused while the first one answers.
+
 ### A restart of the relay does not lock the phones out
 
 The session cookie the relay hands a phone is derived from the relay's secret

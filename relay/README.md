@@ -217,6 +217,20 @@ that way**: the trust belongs to the phone that proved itself, so a caller
 without the credential gets a record of its own and still has to type the access
 code.
 
+## A device that went quiet is dropped
+
+The relay keeps the registration of a device while its channel is open. A
+channel that goes quiet without closing — a dropped network, a sleeping
+laptop, a NAT that forgets the flow — stays open on the relay, and the relay
+then refuses every new registration of that device ("device already
+registered"): the computer could not come back at all, and the owner saw the
+device as offline while the tunnel stayed dead.
+
+The relay therefore remembers when it last heard from a device and drops the
+channels of the ones that went quiet. A device that is really there keeps its
+place: a second registration of the same id is refused while the first one
+answers.
+
 ## A restart does not lock the phones out
 
 The session cookie a phone gets after it types the access code is **derived**,
