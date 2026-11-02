@@ -13,7 +13,8 @@
  *   PORT                 listen port (default 8080)
  *   HOST                 bind address (default 0.0.0.0)
  *   TLS_CERT / TLS_KEY   optional PEM files; when both are set the relay serves HTTPS
- *   RELAY_STATE           where the phone list is persisted (default /var/lib/dsh-relay/state.json)
+ *   RELAY_STATE           where the phone list and the share routes are
+ *                         persisted (default /var/lib/dsh-relay/state.json)
  *   RELAY_LOG            'debug' for per-request logging
  */
 
@@ -36,7 +37,7 @@ const debug = process.env.RELAY_LOG === 'debug'
 const relay = createRelayServer({
   token,
   publicBaseUrl: process.env.RELAY_PUBLIC_URL ?? `http://localhost:${port}`,
-  // The phone list and the trust decisions live on disk.
+  // The phone list, the trust decisions and the share routes live on disk.
   statePath: process.env.RELAY_STATE ?? '/var/lib/dsh-relay/state.json',
   log: (message, extra) => {
     if (debug || !message.startsWith('proxy')) console.log(`[relay] ${message}`, extra ?? '')

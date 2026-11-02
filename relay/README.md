@@ -262,6 +262,66 @@ relay's state file (`RELAY_STATE`, default
 credentials (access key, access code) are not stored: the host registers them
 again on every start.
 
+## Sharing one conversation with a guest
+
+A guest is not a phone. A phone is the owner: it walks into the whole Harness
+and can do everything the desktop can. A guest may look at **one** shared
+conversation and nothing else, so it needs its own door.
+
+That door is the `/s/` namespace. A guest opens
+
+```
+https://rc.example.com/s/<shareId>/…
+```
+
+and the relay hands the request to the host under a fixed path of its own:
+
+| | |
+| --- | --- |
+| the guest's path | `/s/<shareId>/<rest>` |
+| the path the host serves | `/share/<shareId>/<rest>` |
+| the header that names the share | `x-dsh-share: <shareId>` |
+
+The rewrite is the whole point: a guest cannot name another host route, and it
+never reaches the device root, where the host would hand out a launch token.
+Every `x-dsh-*` header the guest brought is dropped before the request is
+forwarded, so a guest cannot pretend to be something it is not. A path that
+tries to walk out of its share (`..`, a percent-encoded `..`) is refused with
+`400` instead of being sent on.
+
+What the relay answers:
+
+| Situation | Answer |
+| --- | --- |
+| the share is unknown | `404 unknown share` |
+| the share is closed | `403 this share is closed` |
+| the device is away | `503 device is offline` |
+| a WebSocket under `/s/` | `403` — a guest reads over SSE, a socket would be an owner stream |
+
+**The relay knows nothing but the route.** It stores which device a share
+belongs to and whether the share is closed — never a passcode, never a session,
+never a file. The passcode is checked by the host, and the host is also the
+party that decides what the guest may see. The registry lives in the state
+file under `shares` and survives a relay restart; the host restores the routes
+it owns with the share list it publishes when it registers.
+
+The host publishes and closes a share on the management channel:
+
+```json
+{ "type": "share_publish", "share_id": "…", "device_id": "…", "revoked": false }
+{ "type": "share_revoke",  "share_id": "…", "device_id": "…" }
+```
+
+and its registration carries the list it owns, so a relay that restarted
+learns the guest links again:
+
+```json
+{ "type": "register", "device_id": "…", "shares": [ { "id": "…", "revoked": false } ] }
+```
+
+A share the host stops listing is **closed**, not forgotten: the link answers
+`403` instead of quietly routing somewhere else.
+
 ## Operations
 
 | Task | Call |
@@ -276,5 +336,8 @@ again on every start.
   never holds a Harness session credential — the Harness injects its own launch
   token on the way out.
 * Everything the phone sends is replayed to that device and nothing else.
+* A guest link reaches one shared conversation and nothing else: the relay
+  rewrites its path into the host's share namespace, drops the headers a guest
+  could forge, and never carries a passcode or a session of its own.
 * Rotating the secret in the Harness (`remote-control.json` → `secret`, or the
   plugin's *rotate* action) invalidates every relay holding the old value.

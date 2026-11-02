@@ -34,6 +34,9 @@ import { WebSocket, WebSocketServer } from 'ws'
 import {
   MANAGEMENT_PATH,
   TUNNEL_PATH,
+  SHARE_HEADER,
+  SHARE_PATH_PREFIX,
+  SHARE_UPSTREAM_PREFIX,
   abortFrame,
   CAPABILITY_BINARY_BODY,
   CAPABILITY_WS_BINARY_BODY,
@@ -109,6 +112,25 @@ const STRIPPED_RESPONSE_HEADERS = new Set([
 const REQUEST_TIMEOUT_MS = 30_000
 
 /**
+ * How long the relay waits for a request whose answer needs a person at the
+ * desktop.
+ *
+ * A phone can ask the desktop to open a native folder chooser. Nobody may be
+ * at the desktop, and the chooser waits for a click that can take minutes —
+ * the ordinary window would answer 504 long before that, and the phone would
+ * report "Couldn't open folder" although the chooser was waiting all along.
+ */
+const INTERACTIVE_REQUEST_TIMEOUT_MS = 300_000
+
+/**
+ * The routes whose answer waits for a person at the desktop.
+ *
+ * The folder picker is the one the Harness app exposes: the phone asks the
+ * desktop, and the desktop shows the operating system's own chooser.
+ */
+const INTERACTIVE_REQUEST_PATHS = new Set(['/api/directoryPicker/pick'])
+
+/**
  * How long a streamed response may stay quiet before the relay calls it
  * stalled.
  *
@@ -136,6 +158,19 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024
 /** Accepted shape of a device id (kept path-safe on purpose). */
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/
 
+/**
+ * The root of the guest (share) namespace, without its trailing slash.
+ *
+ * `/s` on its own names no share; it answers "unknown share" like any other
+ * unknown one.
+ */
+const SHARE_ROOT = SHARE_PATH_PREFIX.slice(0, -1)
+
+/**
+ * Accepted shape of a share id (kept path-safe on purpose, like a device id).
+ */
+const SHARE_ID_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/
+
 /** Reason texts used in `register_nak` frames. */
 const NAK_REASONS = {
   deviceId: 'invalid device id',
@@ -161,6 +196,7 @@ const NAK_REASONS = {
  * @property {any} device
  * @property {import('node:http').ServerResponse} res the phone's response
  * @property {string} session the relay's own session cookie for the phone
+ * @property {string} path the request path, relative to the device root
  * @property {(value: {status: number, headers: Record<string, string | string[]>, body: Buffer}) => void} resolve
  * @property {(reason: Error) => void} reject
  * @property {NodeJS.Timeout | undefined} timer
@@ -273,6 +309,33 @@ function sanitizeRequestHeaders(headers) {
 }
 
 /**
+ * Copy the request headers of a guest into the shape used on the wire.
+ *
+ * A guest may not speak the host's language: every `x-dsh-*` header the guest
+ * brought is dropped, and the relay puts the one header that matters — the
+ * share the request belongs to — in its place.
+ *
+ * @param {Record<string, string | string[] | undefined>} headers
+ * @param {string} shareId the share the request belongs to
+ * @returns {Record<string, string>}
+ */
+function sanitizeShareRequestHeaders(headers, shareId) {
+  /** @type {Record<string, string>} */
+  const out = {}
+  for (const [rawKey, rawValue] of Object.entries(headers || {})) {
+    const key = rawKey.toLowerCase()
+    if (HOP_BY_HOP_HEADERS.has(key)) continue
+    if (key.startsWith('proxy-')) continue
+    if (key.startsWith('x-dsh-')) continue
+    if (rawValue === undefined || rawValue === null) continue
+    out[key] = Array.isArray(rawValue) ? rawValue.join(', ') : String(rawValue)
+  }
+  out['accept-encoding'] = 'identity'
+  out[SHARE_HEADER] = shareId
+  return out
+}
+
+/**
  * Copy response headers back to the phone.
  *
  * `set-cookie` keeps its array shape so every cookie survives.
@@ -321,6 +384,85 @@ function isServerLike(value) {
 }
 
 /**
+ * Normalise a share id.
+ *
+ * A share id ends up in a path and in a header, so it is kept to the same
+ * path-safe shape a device id has. An id that does not fit is no id at all:
+ * the caller answers "unknown share" and never stores anything.
+ *
+ * @param {unknown} value
+ * @returns {string} the id, or `''` when it is not usable
+ */
+function normalizeShareId(value) {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim()
+  if (!SHARE_ID_PATTERN.test(trimmed)) return ''
+  return trimmed
+}
+
+/**
+ * Split a guest path into the share it names and the path below it.
+ *
+ * `/s/<shareId>` and `/s/<shareId>/<rest>` both name a share; the rest is
+ * what the guest wants below it.
+ *
+ * @param {string} pathname
+ * @returns {{shareId: string, rest: string}}
+ */
+function parseSharePath(pathname) {
+  if (!pathname.startsWith(SHARE_PATH_PREFIX)) return { shareId: '', rest: '/' }
+  const tail = pathname.slice(SHARE_PATH_PREFIX.length)
+  const slash = tail.indexOf('/')
+  const rawId = slash === -1 ? tail : tail.slice(0, slash)
+  const rest = slash === -1 ? '/' : tail.slice(slash)
+  let decoded
+  try {
+    decoded = decodeURIComponent(rawId)
+  } catch {
+    return { shareId: '', rest: '/' }
+  }
+  const shareId = normalizeShareId(decoded)
+  if (shareId === '') return { shareId: '', rest: '/' }
+  return { shareId, rest }
+}
+
+/**
+ * Normalise the path of a guest below its share.
+ *
+ * A guest stays inside its share: `.` and `..` are resolved inside the share,
+ * a percent-encoded segment is resolved the same way, and a path that would
+ * walk out of the share is refused instead of being sent on.
+ *
+ * @param {string} rest the path below the share
+ * @returns {string | undefined} the normalised path, or `undefined` when the
+ *   path would leave the share
+ */
+function normalizeShareRest(rest) {
+  if (rest === '' || rest === '/') return '/'
+  const rawSegments = rest.split('/').filter((segment) => segment !== '')
+  /** @type {string[]} */
+  const segments = []
+  for (const raw of rawSegments) {
+    let decoded
+    try {
+      decoded = decodeURIComponent(raw)
+    } catch {
+      return undefined
+    }
+    if (decoded.includes('/') || decoded.includes('\\')) return undefined
+    if (decoded === '.') continue
+    if (decoded === '..') {
+      if (segments.length === 0) return undefined
+      segments.pop()
+      continue
+    }
+    segments.push(raw)
+  }
+  const trailing = rest.endsWith('/') ? '/' : ''
+  return `/${segments.join('/')}${trailing}`
+}
+
+/**
  * Create a relay server.
  *
  * @param {object} [options]
@@ -347,6 +489,7 @@ export function createRelayServer(options = {}) {
     statePath: rawStatePath,
     requestTimeoutMs: rawRequestTimeoutMs,
     streamIdleTimeoutMs: rawStreamIdleTimeoutMs,
+    interactiveRequestTimeoutMs: rawInteractiveRequestTimeoutMs,
   } = options || {}
 
   if (typeof token !== 'string' || token.trim() === '') {
@@ -373,6 +516,21 @@ export function createRelayServer(options = {}) {
     Number.isFinite(rawStreamIdleTimeoutMs) && Number(rawStreamIdleTimeoutMs) > 0
       ? Number(rawStreamIdleTimeoutMs)
       : STREAM_IDLE_TIMEOUT_MS
+  // How long a request that waits for a person at the desktop may take.
+  const interactiveRequestTimeoutMs =
+    Number.isFinite(rawInteractiveRequestTimeoutMs) && Number(rawInteractiveRequestTimeoutMs) > 0
+      ? Number(rawInteractiveRequestTimeoutMs)
+      : INTERACTIVE_REQUEST_TIMEOUT_MS
+  /**
+   * The deadline for one proxied request.
+   *
+   * @param {string} path the request path, relative to the device root
+   * @returns {number} the milliseconds the relay waits for the host
+   */
+  function deadlineFor(path) {
+    const pathname = String(path ?? '').split('?')[0]
+    return INTERACTIVE_REQUEST_PATHS.has(pathname) ? interactiveRequestTimeoutMs : requestTimeoutMs
+  }
 
   /** @type {Map<string, any>} */
   const devices = new Map()
@@ -692,6 +850,10 @@ export function createRelayServer(options = {}) {
       return
     }
     const pathname = url.pathname
+    // The path as it came in, before the URL parser resolved any `..` in it:
+    // a guest that tries to walk out of its share must be answered by the
+    // guest gateway, not by the phone path its attempt resolves to.
+    const rawPath = String(req.url || '/').split('?')[0]
 
     if (pathname === MANAGEMENT_PATH || pathname === TUNNEL_PATH) {
       sendPlain(res, 426, 'websocket upgrade required')
@@ -703,7 +865,90 @@ export function createRelayServer(options = {}) {
       return
     }
 
+    // The guest namespace comes before the phone fallback: a visitor of a
+    // shared conversation must never land on the phone path, where the device
+    // root would hand out a launch token.
+    if (rawPath === SHARE_ROOT || rawPath.startsWith(SHARE_PATH_PREFIX)) {
+      await handleShareRequest(req, res, url, rawPath)
+      return
+    }
+
     await handlePhoneRequest(req, res, url)
+  }
+
+  /* ------------------------------------------------------ guest (shares) */
+
+  /**
+   * Serve one guest request.
+   *
+   * A guest is a visitor of a shared conversation: it holds a link and a
+   * passcode, and it must reach nothing but that one conversation.
+   *
+   * The relay does not know the passcode and does not check it — the host
+   * does, and the host is also the party that decides what a guest may see.
+   * What the relay guarantees is the *route*: the request is rewritten to the
+   * fixed `/share/<shareId>/…` prefix, the share is named in a header the
+   * guest cannot forge, and the guest's own `x-dsh-*` headers are dropped.
+   *
+   * @param {import('node:http').IncomingMessage} req
+   * @param {import('node:http').ServerResponse} res
+   * @param {URL} url
+   * @param {string} rawPath the path as it came in, before any `..` was resolved
+   * @returns {Promise<void>}
+   */
+  async function handleShareRequest(req, res, url, rawPath) {
+    const { shareId, rest } = parseSharePath(rawPath)
+    if (shareId === '') {
+      sendPlain(res, 404, 'unknown share')
+      return
+    }
+    const share = persistedShares.get(shareId)
+    if (share === undefined) {
+      sendPlain(res, 404, 'unknown share')
+      return
+    }
+    if (share.revoked === true) {
+      sendPlain(res, 403, 'this share is closed')
+      return
+    }
+    const device = devices.get(share.device_id)
+    if (!device || device.status === 'offline' || device.revoked === true) {
+      sendPlain(res, 503, 'device is offline')
+      return
+    }
+    const tunnelOpen = device.tunnelSocket && device.tunnelSocket.readyState === WebSocket.OPEN
+    if (!tunnelOpen) {
+      sendPlain(res, 503, 'device has no live tunnel')
+      return
+    }
+
+    const normalized = normalizeShareRest(rest)
+    if (normalized === undefined) {
+      sendPlain(res, 400, 'invalid path')
+      return
+    }
+
+    const method = (req.method || 'GET').toUpperCase()
+    let body = Buffer.alloc(0)
+    try {
+      body = await readBody(req, MAX_BODY_BYTES)
+    } catch {
+      sendPlain(res, 413, 'payload too large')
+      return
+    }
+
+    const headers = sanitizeShareRequestHeaders(req.headers, shareId)
+    const forwarded = String(req.socket.remoteAddress || '')
+    if (forwarded && !headers['x-forwarded-for']) headers['x-forwarded-for'] = forwarded
+    if (!headers['x-forwarded-proto']) headers['x-forwarded-proto'] = 'http'
+    if (body.length > 0) headers['content-length'] = String(body.length)
+    else delete headers['content-length']
+
+    // The guest never names a host path: the path is rewritten, and only the
+    // query travels as it came — the passcode is in there, and the host is the
+    // one that checks it.
+    const upstreamPath = `${SHARE_UPSTREAM_PREFIX}${shareId}${normalized === '/' ? '' : normalized}${url.search || ''}`
+    serveThroughTunnel(device, method, upstreamPath, headers, body, res, '')
   }
 
   /* ------------------------------------------------------- management API */
@@ -1249,6 +1494,15 @@ export function createRelayServer(options = {}) {
         }
         if (list.length > 0) persistedPhones.set(deviceId, list)
       }
+      // The shares come back with the routes they carry: a shared
+      // conversation keeps its link when the relay restarts.
+      for (const [shareId, share] of Object.entries(parsed?.shares ?? {})) {
+        const id = normalizeShareId(shareId)
+        if (id === '') continue
+        const deviceId = typeof share?.device_id === 'string' ? share.device_id : ''
+        if (deviceId === '') continue
+        persistedShares.set(id, { device_id: deviceId, revoked: share?.revoked === true })
+      }
     } catch {
       // A missing or unreadable file simply means "no known phones".
     }
@@ -1317,8 +1571,18 @@ export function createRelayServer(options = {}) {
       }
       const registry = {}
       for (const [deviceId, record] of persistedDevices) registry[deviceId] = record
+      // The shares survive the restart too: a shared conversation keeps its
+      // link when the relay comes back.
+      const shares = {}
+      for (const [shareId, share] of persistedShares) {
+        shares[shareId] = { device_id: share.device_id, revoked: share.revoked === true }
+      }
       const temporary = `${path}.tmp`
-      writeFileSync(temporary, `${JSON.stringify({ phones, revoked: [...revokedDevices], devices: registry }, null, 2)}\n`, 'utf8')
+      writeFileSync(
+        temporary,
+        `${JSON.stringify({ phones, revoked: [...revokedDevices], devices: registry, shares }, null, 2)}\n`,
+        'utf8',
+      )
       renameSync(temporary, path)
     } catch {
       // Persistence is best effort; the relay keeps serving without it.
@@ -1336,6 +1600,18 @@ export function createRelayServer(options = {}) {
 
   /** The devices the relay has seen, so an away device still shows up. */
   const persistedDevices = new Map()
+
+  /**
+   * The shares the relay knows, keyed by share id.
+   *
+   * A share is only a route: the relay knows which device it belongs to and
+   * whether it is closed. The passcode is checked by the host, and the host
+   * decides what the guest may see — the relay never holds either.
+   *
+   * @type {Map<string, {device_id: string, revoked: boolean}>}
+   */
+  const persistedShares = new Map()
+
   /**
    * Note that the phone list changed and schedule a write.
    *
@@ -1496,6 +1772,49 @@ export function createRelayServer(options = {}) {
   }
 
   /**
+   * The page a phone sees when a link cannot reach the agent.
+   *
+   * A plain-text answer can be handed to the user as a file to download
+   * instead of being shown, which looks like a broken link and hides the
+   * reason. An HTML page says what is missing and what to do about it.
+   *
+   * @param {string} title the headline
+   * @param {string} detail the sentence below it
+   * @returns {string}
+   */
+  function linkErrorPage(title, detail) {
+    return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>${title} · DeepSeek Harness</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100dvh; display: flex; align-items: center; justify-content: center;
+         font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: #f6f7f9; color: #1c1f23; padding: 24px; }
+  @media (prefers-color-scheme: dark) { body { background: #14161a; color: #e6e8eb; } }
+  .card { background: #fff; border: 1px solid #dcdfe4; border-radius: 14px; padding: 24px; max-width: 30rem; }
+  @media (prefers-color-scheme: dark) { .card { background: #1c1f24; border-color: #2c3038; } }
+  h1 { font-size: 1.05rem; margin: 0 0 8px; }
+  p { margin: 0; color: #5b6270; }
+  @media (prefers-color-scheme: dark) { p { color: #9aa2b1; } }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>${title}</h1>
+    <p>${detail}</p>
+  </div>
+</body>
+</html>
+`
+  }
+
+  /**
    * The page a phone sees before it may control the agent.
    *
    * It asks for the device's passcode; the answer is posted back to the same
@@ -1604,7 +1923,10 @@ export function createRelayServer(options = {}) {
     const session = newSessionFor(device, phone)
     device.phoneSessions.add(session)
     res.writeHead(303, {
-      location: url.pathname,
+      // The query carries the access key. Dropping it would leave the address
+      // bar with a link that no browser can open any more, because the copy
+      // the owner pastes elsewhere has no credential left.
+      location: `${url.pathname}${url.search}`,
       'set-cookie': [
         `${PHONE_SESSION_COOKIE}=${session}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${PHONE_SESSION_MAX_AGE}`,
         `${PHONE_DEVICE_COOKIE}=${phone.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${PHONE_COOKIE_MAX_AGE}`,
@@ -1656,7 +1978,10 @@ export function createRelayServer(options = {}) {
         await serveUnlock(device, req, res, url, method)
         return
       }
-      sendPlain(res, 401, 'a valid access link is required')
+      sendHtml(res, 401, linkErrorPage(
+        '这个链接打不开',
+        '链接里缺少访问密钥。请用电脑端「设置 → Remote Control」里的完整链接，或重新扫一次二维码。',
+      ))
       return
     }
     const tunnelOpen = device.tunnelSocket && device.tunnelSocket.readyState === WebSocket.OPEN
@@ -1721,6 +2046,7 @@ export function createRelayServer(options = {}) {
       device,
       res,
       session,
+      path,
       chunks: [],
       headers: null,
       status: 0,
@@ -1799,7 +2125,7 @@ export function createRelayServer(options = {}) {
    * @param {PendingRequest} pending
    * @param {number} [delay] the window in milliseconds
    */
-  function armRequestTimer(pending, delay = pending.streaming ? streamIdleTimeoutMs : requestTimeoutMs) {
+  function armRequestTimer(pending, delay = pending.streaming ? streamIdleTimeoutMs : deadlineFor(pending.path)) {
     clearTimeout(pending.timer)
     pending.timer = setTimeout(() => {
       if (!inflight.has(pending.id)) return
@@ -1970,6 +2296,8 @@ export function createRelayServer(options = {}) {
       rejectUpgrade(socket, 400, 'bad request')
       return
     }
+    // The path as it came in, before the URL parser resolved any `..` in it.
+    const rawPath = String(req.url || '/').split('?')[0]
 
     if (url.pathname === MANAGEMENT_PATH) {
       if (!isAuthorizedUpgrade(req)) {
@@ -1991,6 +2319,14 @@ export function createRelayServer(options = {}) {
         return
       }
       acceptUpgrade(req, socket, head, (client) => openTunnelChannel(client, deviceId))
+      return
+    }
+
+    // A guest never gets a WebSocket: the shared conversation is read over
+    // SSE, and a socket would hand the guest the host's own stream without a
+    // passcode ever being asked for.
+    if (rawPath === SHARE_ROOT || rawPath.startsWith(SHARE_PATH_PREFIX)) {
+      rejectUpgrade(socket, 403, 'a shared conversation does not carry websockets')
       return
     }
 
@@ -2088,6 +2424,14 @@ export function createRelayServer(options = {}) {
           closeSocket(socket, 1000)
           return
         }
+        if (frame.type === 'share_publish') {
+          publishShare(frame, device)
+          return
+        }
+        if (frame.type === 'share_revoke') {
+          revokeShare(frame, device)
+          return
+        }
         if (device) device.lastSeenAt = new Date().toISOString()
         logInfo('relay: ignoring frame on management channel', { type: frame.type })
       } catch (error) {
@@ -2106,6 +2450,99 @@ export function createRelayServer(options = {}) {
         logInfo('relay: management socket closed', { deviceId: device.deviceId })
       }
     })
+  }
+
+  /* ----------------------------------------------------------- share routes */
+
+  /**
+   * The device a share belongs to.
+   *
+   * The frame names the device; the channel that carries the frame is the
+   * fallback, so a host that publishes before it registered still routes.
+   *
+   * @param {Record<string, any>} frame
+   * @param {any} device the device that owns the management channel
+   * @returns {string} the device id, or `''` when there is none
+   */
+  function shareDeviceId(frame, device) {
+    const named = typeof frame?.device_id === 'string' ? frame.device_id.trim() : ''
+    if (named !== '') return named
+    return typeof device?.deviceId === 'string' ? device.deviceId : ''
+  }
+
+  /**
+   * Publish a share, or publish it again in a new state.
+   *
+   * The relay stores the route and nothing else: no passcode, no session, no
+   * project. The host checks the passcode and decides what the guest sees.
+   *
+   * @param {Record<string, any>} frame
+   * @param {any} device the device that owns the management channel
+   */
+  function publishShare(frame, device) {
+    const shareId = normalizeShareId(frame?.share_id)
+    const deviceId = shareDeviceId(frame, device)
+    if (shareId === '' || deviceId === '') {
+      logInfo('relay: ignoring an unusable share', { shareId: String(frame?.share_id ?? '') })
+      return
+    }
+    const revoked = frame?.revoked === true
+    persistedShares.set(shareId, { device_id: deviceId, revoked })
+    markStateDirty(device)
+    logInfo('relay: share published', { shareId, deviceId, revoked })
+  }
+
+  /**
+   * Close a share.
+   *
+   * The record stays in the relay's state: a link that is closed answers
+   * "forbidden" instead of "unknown", and it stays closed across a restart.
+   *
+   * @param {Record<string, any>} frame
+   * @param {any} device the device that owns the management channel
+   */
+  function revokeShare(frame, device) {
+    const shareId = normalizeShareId(frame?.share_id)
+    if (shareId === '') {
+      logInfo('relay: ignoring an unusable share revocation', { shareId: String(frame?.share_id ?? '') })
+      return
+    }
+    const existing = persistedShares.get(shareId)
+    const deviceId = shareDeviceId(frame, device) || existing?.device_id || ''
+    persistedShares.set(shareId, { device_id: deviceId, revoked: true })
+    markStateDirty(device)
+    logInfo('relay: share revoked', { shareId, deviceId })
+  }
+
+  /**
+   * Apply the share list a device published with its registration.
+   *
+   * The list is the device's own truth: a share it does not list any more is
+   * closed rather than forgotten, so a stale link answers "forbidden" instead
+   * of routing somewhere else. A host that publishes no list at all — an
+   * older one — changes nothing.
+   *
+   * @param {any} device
+   * @param {unknown[]} list
+   */
+  function applyPublishedShares(device, list) {
+    const listed = new Set()
+    for (const entry of list) {
+      const shareId = normalizeShareId(entry?.id)
+      if (shareId === '') continue
+      listed.add(shareId)
+      persistedShares.set(shareId, {
+        device_id: device.deviceId,
+        revoked: entry?.revoked === true,
+      })
+    }
+    for (const [shareId, share] of persistedShares) {
+      if (listed.has(shareId)) continue
+      if (share.device_id !== device.deviceId) continue
+      if (share.revoked === true) continue
+      persistedShares.set(shareId, { device_id: share.device_id, revoked: true })
+    }
+    markStateDirty(device)
   }
 
   /**
@@ -2201,6 +2638,12 @@ export function createRelayServer(options = {}) {
     devices.set(deviceId, device)
     if (revokedDevices.has(deviceId)) device.revoked = true
     restorePhones(device)
+    // The shares the device publishes with its registration restore the
+    // routes of the conversations it shares — a relay that restarted serves
+    // them again.
+    if (Array.isArray(frame.shares)) {
+      applyPublishedShares(device, frame.shares)
+    }
     // A device that has just registered belongs in the persisted registry, so
     // it survives a relay restart and can still be revoked while it is away.
     markStateDirty(device)
@@ -2725,6 +3168,15 @@ export function createRelayServer(options = {}) {
 
     if (device.status === 'offline' || device.revoked) {
       rejectUpgrade(socket, 403, 'device is offline')
+      return
+    }
+    // A bridge is an owner peer: the host answers it with the app's own
+    // session cookie, so it carries a phone credential like every other
+    // request. Without this check the device id alone was enough to open a
+    // socket onto the host.
+    const access = authorizePhone(device, req, url)
+    if (!access.ok) {
+      rejectUpgrade(socket, 401, 'unauthorized')
       return
     }
     if (device.mode === 'push') {

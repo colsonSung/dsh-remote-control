@@ -26,6 +26,25 @@ export const MANAGEMENT_PATH = '/v1/remote/create'
 /** Tunnel channel path (host -> relay). */
 export const TUNNEL_PATH = '/v1/remote/http'
 
+/**
+ * The path prefix the guest (share) namespace lives under on the relay.
+ *
+ * A guest opens `/s/<shareId>/…`. The relay rewrites that path to
+ * `/share/<shareId>/…` before it hands the request to the host, so a guest can
+ * never name another host route.
+ */
+export const SHARE_PATH_PREFIX = '/s/'
+
+/**
+ * The path prefix a guest request is rewritten to on the host.
+ */
+export const SHARE_UPSTREAM_PREFIX = '/share/'
+
+/**
+ * The header that carries the share id from the relay to the host.
+ */
+export const SHARE_HEADER = 'x-dsh-share'
+
 /** Capabilities the host advertises on the tunnel channel. */
 export const CAPABILITIES = ['request_chunk', 'response_chunk', 'abort']
 
@@ -111,7 +130,12 @@ export function decodeFrame(text) {
 
 /**
  * The host announces itself on the management channel.
- * @param {{deviceId: string, alias: string, platform: string, clientVersion: string, localBaseUrl: string, accessKey?: string, passcode?: string}} input
+ *
+ * `shares` is the list of conversations the host shares with guests. The relay
+ * uses it to restore its routes after a restart; a host that does not share
+ * anything yet sends no list at all.
+ *
+ * @param {{deviceId: string, alias: string, platform: string, clientVersion: string, localBaseUrl: string, accessKey?: string, passcode?: string, shares?: {id: string, revoked?: boolean}[]}} input
  */
 export function registerFrame(input) {
   return {
@@ -124,6 +148,10 @@ export function registerFrame(input) {
     access_key: input.accessKey ?? '',
     passcode: input.passcode ?? '',
     capabilities: [...CAPABILITIES],
+    shares: (input.shares ?? []).map((share) => ({
+      id: share.id,
+      revoked: share.revoked === true,
+    })),
   }
 }
 
@@ -195,6 +223,39 @@ export function decodeBinaryBody(message) {
  */
 export function revokeFrame(reason) {
   return { type: 'revoke', reason }
+}
+
+/**
+ * The host publishes a share, or publishes it again in a new state.
+ *
+ * The relay stores no passcode and no session reference: a share is only a
+ * route. The host checks the passcode and decides what the guest may see.
+ *
+ * @param {{shareId: string, deviceId: string, revoked?: boolean}} input
+ */
+export function sharePublishFrame(input) {
+  return {
+    type: 'share_publish',
+    share_id: input.shareId,
+    device_id: input.deviceId,
+    revoked: input.revoked === true,
+  }
+}
+
+/**
+ * The host closes a share.
+ *
+ * The record stays in the relay's state, so a link that is closed answers
+ * "forbidden" instead of "unknown" — and it stays closed across a restart.
+ *
+ * @param {{shareId: string, deviceId: string}} input
+ */
+export function shareRevokeFrame(input) {
+  return {
+    type: 'share_revoke',
+    share_id: input.shareId,
+    device_id: input.deviceId,
+  }
 }
 
 /* ----------------------------------------------------------- tunnel frames */

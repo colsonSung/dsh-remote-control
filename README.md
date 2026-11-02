@@ -24,6 +24,30 @@ second, stripped-down mobile UI to build, and none to keep in step.
 | **A tunnel that survives an event stream** | a response that never ends is forwarded chunk by chunk, so the phone sees the output as it happens |
 | **Payloads that fit in a phone's budget** | a busy session's snapshot is gzipped and marked, which is the difference between seconds of "Loading history…" and a fraction of one |
 | **A relay that is yours** | the relay is a small standalone server you can deploy on a VPS, or run on your own network |
+| **A conversation you can share** | a link and an 8-digit passcode open **one** conversation to a guest — never the rest of the Harness |
+
+## Sharing a conversation with a guest
+
+A guest is not the owner. The owner shares **one conversation** with a link and
+an 8-digit passcode, and the guest gets a small page of its own: the
+conversation, and the files of the task's project folder beside it. The guest
+never becomes a peer of the Harness server — it cannot see the owner's other
+sessions, the owner's credentials or the owner's other shares.
+
+| | |
+|---|---|
+| **One link, one conversation** | a share names one session; nothing else of the Harness is reachable through it |
+| **Its own passcode** | the guest proves it with 8 digits; the link alone opens nothing |
+| **Read or write** | a read share shows the conversation; a write share lets the guest send messages into it |
+| **A queue, not a stampede** | the agent answers one message at a time, and every guest of the share sees the same queue at the same moment |
+| **Documents together** | the guests of a share may edit one file at the same time, and the agent's own writes are guarded by the version of the file |
+
+The owner opens **Settings → Remote Control → Share this conversation**, gets the
+link and the passcode, and can revoke the link at any time. The relay carries
+the guest traffic in its own namespace (`/s/<share id>/…`) and rewrites it for
+the host, so a guest can never name another route of the host.
+
+The share feature needs a relay that knows it: **relay 1.2.0** or newer.
 
 ## The phone experience
 
@@ -187,12 +211,17 @@ deployment guide.
 cd plugin
 npm install
 node --test --test-force-exit tests/*.test.js
+
+cd ../relay
+npm install
+node --test tests/*.test.js
 ```
 
 The tests cover the tunnel end to end: the access-code gate, the trusted-device
 bypass, the brute-force guard, the revoke chain, and the relay's persistence
 across a restart — plus the phone drawer, whose dismissal must never take a
-control out from under the finger.
+control out from under the finger, the guest page of a shared conversation and
+the queue that keeps the agent to one message at a time.
 
 ## License
 
