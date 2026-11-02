@@ -31,6 +31,20 @@ if ! command -v dsh >/dev/null 2>&1; then
   exit 1
 fi
 
+# The dependencies of the plugin itself.
+#
+# The profile links the plugin as a local package, and pnpm does not install
+# the dependencies of a linked package: it expects the folder to bring them.
+# Without this step the plugin is installed but cannot even be loaded — the
+# QR code of the settings page and the tunnel to the relay both need a
+# dependency of theirs.
+echo "==> installing the dependencies of the plugin"
+if command -v pnpm >/dev/null 2>&1; then
+  ( cd "$HERE/plugin" && pnpm install --ignore-scripts )
+else
+  ( cd "$HERE/plugin" && npm install --no-audit --no-fund )
+fi
+
 echo "==> installing $PACKAGE into the '$PROFILE' profile"
 dsh plugin --profile "$PROFILE" add "$HERE/plugin"
 

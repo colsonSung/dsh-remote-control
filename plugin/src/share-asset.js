@@ -65,9 +65,6 @@ export function mermaidCandidates() {
     join(WORKSPACE_ROOT, LIBRARY),
     // An install right beside this plugin.
     join(PLUGIN_ROOT, LIBRARY),
-    // The checkout this workspace knows about, wherever the plugin itself
-    // was installed from.
-    '/Users/ethansong/Documents/deepseek-harness/default-workspace/markdown-mermaid-preview/node_modules/mermaid/dist/mermaid.min.js',
   ]
   return [...new Set(candidates)]
 }
