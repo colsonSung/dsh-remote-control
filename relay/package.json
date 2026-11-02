@@ -1,6 +1,6 @@
 {
-  "name": "@local/remote-control-relay",
-  "version": "1.1.0",
+  "name": "dsh-remote-control-relay",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "Standalone relay for DeepSeek Harness Remote Control — deploy it on a public host to reach your agent from a phone anywhere.",
@@ -17,5 +17,12 @@
   ],
   "dependencies": {
     "ws": "^8.18.0"
+  },
+  "license": "MIT",
+  "author": "Ethan Song",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/colsonSung/dsh-remote-control.git",
+    "directory": "relay"
   }
 }
