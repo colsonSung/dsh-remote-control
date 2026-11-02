@@ -87,6 +87,27 @@ export function bearerHeader(token) {
   return `Bearer ${token}`
 }
 
+/* ------------------------------------------------------- guest (share) paths */
+
+/**
+ * The path prefix the guest (share) namespace lives under on the relay.
+ *
+ * A guest opens `/s/<shareId>/…`. The relay rewrites that path to
+ * `/share/<shareId>/…` before it hands the request to the host, so a guest can
+ * never name another host route.
+ */
+export const SHARE_PATH_PREFIX = '/s/'
+
+/**
+ * The path prefix a guest request is rewritten to on the host.
+ */
+export const SHARE_UPSTREAM_PREFIX = '/share/'
+
+/**
+ * The header that carries the share id from the relay to the host.
+ */
+export const SHARE_HEADER = 'x-dsh-share'
+
 /* ------------------------------------------------------------------ frames */
 
 /** @param {Record<string, unknown>} frame */
@@ -111,7 +132,12 @@ export function decodeFrame(text) {
 
 /**
  * The host announces itself on the management channel.
- * @param {{deviceId: string, alias: string, platform: string, clientVersion: string, localBaseUrl: string, accessKey?: string, passcode?: string}} input
+ *
+ * The share list travels with the registration: a relay that restarted has
+ * forgotten which guest links it routed, and the registration is where the
+ * host tells it again.
+ *
+ * @param {{deviceId: string, alias: string, platform: string, clientVersion: string, localBaseUrl: string, accessKey?: string, passcode?: string, shares?: {id: string, revoked: boolean}[]}} input
  */
 export function registerFrame(input) {
   return {
@@ -124,6 +150,42 @@ export function registerFrame(input) {
     access_key: input.accessKey ?? '',
     passcode: input.passcode ?? '',
     capabilities: [...CAPABILITIES],
+    shares: (input.shares ?? []).map((share) => ({
+      id: share.id,
+      revoked: share.revoked === true,
+    })),
+  }
+}
+
+/**
+ * The host publishes one shared session to the relay.
+ *
+ * The relay routes the guest link to this device; the frame tells it that the
+ * link exists and whether it is still open.
+ *
+ * @param {{shareId: string, deviceId: string, revoked?: boolean, revokedAt?: number | null}} input
+ */
+export function sharePublishFrame(input) {
+  return {
+    type: 'share_publish',
+    share_id: input.shareId,
+    device_id: input.deviceId,
+    revoked: input.revoked === true,
+    revoked_at: input.revokedAt ?? null,
+  }
+}
+
+/**
+ * The host withdraws one shared session from the relay.
+ *
+ * @param {{shareId: string, deviceId: string, revokedAt?: number | null}} input
+ */
+export function shareRevokeFrame(input) {
+  return {
+    type: 'share_revoke',
+    share_id: input.shareId,
+    device_id: input.deviceId,
+    revoked_at: input.revokedAt ?? null,
   }
 }
 

@@ -63,6 +63,8 @@ import {
   registerFrame,
   responseChunkFrame,
   responseFrame,
+  sharePublishFrame,
+  shareRevokeFrame,
   tunnelUrl,
   upgradedFrame,
   wsCloseFrame,
@@ -157,6 +159,18 @@ const EVENT_STREAM_CONTENT_TYPE = 'text/event-stream'
  * busy while the frame overhead stays in the noise.
  */
 const STREAM_CHUNK_BYTES = 64 * 1024
+
+/**
+ * The size from which a response travels in chunks.
+ *
+ * The web app's client-module bundle is several megabytes, and a phone
+ * receives it through a relay on the other side of the world. One frame puts
+ * the whole body on the wire in a single burst, and WebKit — the engine behind
+ * Safari — never gets its HTTP/2 window refilled in time: the transfer stalls
+ * and the page stays empty. Below this size the buffered path stays: one frame
+ * is cheaper, and the burst is small enough to be absorbed.
+ */
+const LARGE_BODY_STREAM_BYTES = 512 * 1024
 
 /** The gzip implementation, as a promise. */
 const gzipAsync = promisify(gzip)
@@ -272,6 +286,26 @@ function hasSessionCookie(headers, authority) {
 }
 
 /**
+ * Is this upstream path a guest request?
+ *
+ * A guest request is one that a share link produced. It must never receive
+ * the launch token and must never be answered with an owner cookie: the guest
+ * is not the owner, and a guest that could mint the owner's session would be
+ * the owner.
+ *
+ * The relay forwards a guest link under `/share/`; `/s/` is the path the relay
+ * publishes the link with, and it is refused the same way in case a relay
+ * forwards it unchanged.
+ *
+ * @param {string} pathname
+ * @returns {boolean}
+ */
+export function isGuestPath(pathname) {
+  if (typeof pathname !== 'string' || pathname.length === 0) return false
+  return pathname.startsWith('/share/') || pathname.startsWith('/s/')
+}
+
+/**
  * Compress a response body that has to travel over a slow link.
  *
  * The tunnel carries a body base64-encoded inside a JSON frame, so every byte
@@ -319,6 +353,67 @@ async function compressResponse(status, headers, body) {
   }
 }
 
+/**
+ * Rewrite the HTML document a phone receives.
+ *
+ * Two things are wrong for a phone on the way out:
+ *
+ *   1. The web app ships its client-module bundles with `rel="preload"
+ *      as="script"`, but the browser loads those bundles as ES modules. WebKit
+ *      — the engine behind Safari — does not reuse a classic script preload for
+ *      a module import: it cancels the preload, the import fails with it, and
+ *      the page never finishes booting. `rel="modulepreload"` is the preload a
+ *      module import can use.
+ *   2. A focused field makes the browser zoom the page in, which on a phone
+ *      leaves the composer stretched across the screen and the rail out of
+ *      sight. The viewport therefore asks for a maximum scale of one, so the
+ *      focus cannot magnify anything.
+ *
+ * Only the tunnel rewrites the document: the desktop app keeps the markup it
+ * shipped with.
+ *
+ * @param {Buffer} body the upstream response body
+ * @param {Record<string, unknown>} headers the upstream response headers
+ * @returns {{ body: Buffer, headers: Record<string, unknown> }} the body and headers to serve
+ */
+export function rewritePhoneDocument(body, headers) {
+  const source = headers ?? {}
+  const type = String(source['content-type'] ?? source['Content-Type'] ?? '')
+  if (!/^text\/html/i.test(type.trim())) return { body, headers: { ...source } }
+  const text = body.toString('utf8')
+  let rewritten = text.replace(/<link\b[^>]*>/g, (tag) => {
+    if (!/rel="preload"/.test(tag)) return tag
+    if (!/as="script"/.test(tag)) return tag
+    const href = /href="([^"]*)"/.exec(tag)
+    if (href === null || !href[1].startsWith('plugins/??')) return tag
+    return tag.replace('rel="preload"', 'rel="modulepreload"').replace(/\s*as="script"/, '')
+  })
+  const viewportMeta = /<meta\s+name="viewport"\s+content="([^"]*)"\s*\/?>/i
+  if (viewportMeta.test(rewritten)) {
+    rewritten = rewritten.replace(viewportMeta, (tag, content) => {
+      const parts = content
+        .split(',')
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0 && !/^(initial-scale|maximum-scale|user-scalable)=/i.test(part))
+      parts.push('initial-scale=1', 'maximum-scale=1', 'user-scalable=no')
+      // The safe-area insets only exist when the page covers the notch.
+      if (!parts.some((part) => /^viewport-fit=/i.test(part))) parts.push('viewport-fit=cover')
+      return `<meta name="viewport" content="${parts.join(', ')}">`
+    })
+  } else {
+    // A document without a viewport would be laid out for a desktop window.
+    const meta = '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">'
+    rewritten = /<head(\s[^>]*)?>/i.test(rewritten)
+      ? rewritten.replace(/<head(\s[^>]*)?>/i, (tag) => `${tag}${meta}`)
+      : `${meta}${rewritten}`
+  }
+  if (rewritten === text) return { body, headers: { ...source } }
+  const next = Buffer.from(rewritten, 'utf8')
+  const out = { ...source }
+  const lengthKey = 'content-length' in out ? 'content-length' : 'Content-Length' in out ? 'Content-Length' : null
+  if (lengthKey !== null) out[lengthKey] = String(next.length)
+  return { body: next, headers: out }
+}
 /**
  * Does the raw query string already carry `name`?
  * @param {string} query
@@ -581,6 +676,8 @@ export class RelayClient {
     this._binaryWsPayloads = false
     /** @type {boolean} */
     this._stopped = true
+    /** @type {{ id: string, revoked: boolean }[]} the shared sessions the relay routes */
+    this._shares = []
 
     /** @type {Map<string, Set<Function>>} */
     this._listeners = new Map()
@@ -616,6 +713,77 @@ export class RelayClient {
       publicUrl: this._publicUrl,
       error: this._error,
     }
+  }
+
+  /**
+   * The shared sessions the relay routes for this device.
+   *
+   * The list travels with the next registration, so a relay that restarted
+   * learns the guest links again.
+   *
+   * @returns {{ id: string, revoked: boolean }[]}
+   */
+  shares() {
+    return this._shares.map((share) => ({ ...share }))
+  }
+
+  /**
+   * Replace the list of shared sessions.
+   *
+   * @param {{ id: string, revoked?: boolean }[]} shares
+   * @returns {{ id: string, revoked: boolean }[]}
+   */
+  setShares(shares) {
+    this._shares = (Array.isArray(shares) ? shares : [])
+      .filter((share) => typeof share?.id === 'string' && share.id.length > 0)
+      .map((share) => ({
+        id: share.id,
+        revoked: share.revoked === true,
+        revokedAt: Number.isFinite(share.revokedAt) ? share.revokedAt : null,
+      }))
+    return this.shares()
+  }
+
+  /**
+   * Publish one shared session to the relay.
+   *
+   * The relay routes the guest link to this device; the frame tells it that
+   * the link exists and whether it is still open.
+   *
+   * @param {string} shareId
+   * @param {boolean} [revoked]
+   * @returns {boolean} whether the frame was sent
+   */
+  publishShare(shareId, revoked = false, revokedAt = null) {
+    if (typeof shareId !== 'string' || shareId.length === 0) return false
+    const entry = { id: shareId, revoked: revoked === true, revokedAt: revokedAt ?? null }
+    const at = this._shares.findIndex((share) => share.id === shareId)
+    if (at === -1) this._shares.push(entry)
+    else this._shares[at] = entry
+    return this._send(
+      this._sessions.management?.socket,
+      sharePublishFrame({ shareId, deviceId: this.deviceId, revoked: revoked === true, revokedAt: revokedAt ?? null }),
+    )
+  }
+
+  /**
+   * Withdraw one shared session from the relay.
+   *
+   * The share stays in the registration list, marked as revoked: a relay that
+   * restarts must learn that the link is closed, not that it never existed.
+   *
+   * @param {string} shareId
+   * @returns {boolean} whether the frame was sent
+   */
+  revokeShare(shareId, revokedAt = Date.now()) {
+    if (typeof shareId !== 'string' || shareId.length === 0) return false
+    const at = this._shares.findIndex((share) => share.id === shareId)
+    if (at === -1) this._shares.push({ id: shareId, revoked: true, revokedAt })
+    else this._shares[at] = { id: shareId, revoked: true, revokedAt }
+    return this._send(
+      this._sessions.management?.socket,
+      shareRevokeFrame({ shareId, deviceId: this.deviceId, revokedAt }),
+    )
   }
 
   /**
@@ -849,6 +1017,7 @@ export class RelayClient {
       localBaseUrl: this.localBaseUrl,
       accessKey: this.accessKey,
       passcode: this.passcode,
+      shares: this._shares,
     })
     this._send(session.socket, frame)
     if (session.registrationTimer) clearTimeout(session.registrationTimer)
@@ -1117,10 +1286,14 @@ export class RelayClient {
    * `hasSessionCookie`). `forceToken` trades it in regardless, which is how a
    * refused session is recovered.
    *
+   * A guest request never gets the token. The guest is a stranger with a
+   * passcode, and the launch token is the owner's credential: handing it out
+   * would make every guest the owner.
+   *
    * @param {string} rawPath
    * @param {Record<string, unknown>} [headers] the raw (pre-rewrite) headers
    * @param {{ method?: string, forceToken?: boolean }} [options]
-   * @returns {{ url: string, pathname: string, query: string, isDeviceRoot: boolean, tokenInjected: boolean }}
+   * @returns {{ url: string, pathname: string, query: string, isDeviceRoot: boolean, isGuest: boolean, tokenInjected: boolean }}
    */
   _resolveUpstream(rawPath, headers, options = {}) {
     const { pathname, query } = splitRequestTarget(rawPath)
@@ -1139,10 +1312,12 @@ export class RelayClient {
 
     const method = (options.method ?? 'GET').toUpperCase()
     const isDeviceRoot = relative === '/'
+    const isGuest = isGuestPath(relative)
     // The server only mints a session cookie for `GET /?token=…`.
     const canInject =
       method === 'GET' &&
       isDeviceRoot &&
+      !isGuest &&
       this.launchToken.length > 0 &&
       !hasQueryParam(query, 'token')
     const tokenInjected =
@@ -1155,7 +1330,7 @@ export class RelayClient {
     if (tokenInjected) search = appendQueryParam(search, 'token', this.launchToken)
     target.search = search ? `?${search}` : ''
 
-    return { url: target.href, pathname: relative, query: search, isDeviceRoot, tokenInjected }
+    return { url: target.href, pathname: relative, query: search, isDeviceRoot, isGuest, tokenInjected }
   }
 
   /**
@@ -1229,7 +1404,10 @@ export class RelayClient {
       // app restarted on another port, or the signing secret changed. The
       // server answers 401, and only the launch token buys a fresh cookie —
       // without this retry the phone stays locked out for good.
-      if (opened.status === 401 && !resolved.tokenInjected) {
+      //
+      // A guest request never gets that retry: the launch token is the owner's
+      // credential, and a guest that could trade it in would be the owner.
+      if (opened.status === 401 && !resolved.tokenInjected && !resolved.isGuest) {
         const retry = this._resolveUpstream(rawPath, frame.headers, { method, forceToken: true })
         if (retry.tokenInjected) {
           this._log('the session cookie was refused; retrying with the launch token', {
@@ -1256,14 +1434,41 @@ export class RelayClient {
         return
       }
 
-      const buffer = await this._readResponseBody(opened.response)
+      const raw = await this._readResponseBody(opened.response)
+      // A phone is usually Safari, and Safari cannot boot the app from a
+      // classic script preload. The rewrite only touches the phone's copy.
+      const { body: buffer, headers: rewrittenHeaders } = rewritePhoneDocument(raw, opened.rawHeaders)
       const response = {
         status: opened.status,
-        headers: this._normalizeResponseHeaders(opened.rawHeaders, buffer.length),
+        headers: this._normalizeResponseHeaders(rewrittenHeaders, buffer.length),
         body: buffer,
       }
       const compressed = await compressResponse(response.status, response.headers, response.body)
-      if (this._binaryBodies && compressed.body.length > 0) {
+      if (compressed.body.length >= LARGE_BODY_STREAM_BYTES) {
+        // The client-module bundle is several megabytes. One frame reaches the
+        // phone as one burst, and WebKit's HTTP/2 window never catches up: the
+        // transfer stalls and the page never finishes booting. Chunked frames
+        // let the relay hand the body over as it arrives.
+        const headers = { ...compressed.headers }
+        delete headers['content-length']
+        this._sendTunnel(
+          chunkedResponseFrame({
+            id,
+            status: response.status,
+            headers,
+          }),
+        )
+        for (let at = 0; at < compressed.body.length; at += STREAM_CHUNK_BYTES) {
+          const end = Math.min(at + STREAM_CHUNK_BYTES, compressed.body.length)
+          this._sendTunnel(
+            responseChunkFrame({
+              id,
+              chunk: compressed.body.subarray(at, end).toString('base64'),
+              last: end >= compressed.body.length,
+            }),
+          )
+        }
+      } else if (this._binaryBodies && compressed.body.length > 0) {
         // A binary message carries the body without the base64 inflation.
         this._sendTunnelBody(id, response.status, compressed.headers, compressed.body)
       } else {

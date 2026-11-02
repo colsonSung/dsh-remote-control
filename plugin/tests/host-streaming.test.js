@@ -22,6 +22,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import { test } from 'node:test'
@@ -586,6 +587,64 @@ test('a streamed response ends with one last chunk', async (t) => {
     chunks.every((chunk) => chunk.last === false),
     'only the last chunk is flagged',
   )
+})
+
+test('a large response is streamed in chunks so a phone can consume it', async (t) => {
+  // The client-module bundle is several megabytes. Sent as one frame it
+  // reaches the phone as one burst, and WebKit's HTTP/2 window never catches
+  // up: the transfer stalls and the page never finishes booting. Chunked
+  // frames let the relay hand the body to the phone as it arrives.
+  // Random bytes: a repetitive payload would compress to nothing, and the
+  // threshold is about the bytes that actually travel.
+  const payload = randomBytes(1_200_000).toString('base64')
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/javascript' })
+    res.end(payload)
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const { client } = makeHost(relay.url, upstream.url)
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-large',
+        method: 'GET',
+        path: '/bundle.js',
+        headers: {},
+        body: null,
+      }),
+    ),
+  )
+
+  const head = await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(head.id, 'req-large')
+  assert.equal(head.chunked, true)
+  assert.equal(head.body, null)
+  // The length of a streamed body is unknown, so the head must not claim one.
+  assert.equal(head.headers['content-length'], undefined)
+  // The body still travels compressed.
+  assert.equal(head.headers['content-encoding'], 'gzip')
+
+  const chunks = []
+  for (;;) {
+    const chunk = await tunnel.next((frame) => frame.type === 'response_chunk')
+    chunks.push(chunk)
+    if (chunk.last === true) break
+  }
+  assert.ok(chunks.length > 1, 'a large body travels in more than one chunk')
+  const decoded = Buffer.concat(chunks.map((chunk) => Buffer.from(String(chunk.chunk), 'base64')))
+  assert.equal(gunzipSync(decoded).toString('utf8'), payload)
 })
 
 test('a normal response still takes the buffered and compressed path', async (t) => {

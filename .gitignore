@@ -1,4 +1,7 @@
-node_modules/
+# The dependencies are never committed — not even as a link into somebody
+# else's machine: the pattern has no slash, so it covers a directory and a
+# symbolic link alike.
+node_modules
 *.log
 .DS_Store
 *.tgz

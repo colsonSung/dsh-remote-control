@@ -66,6 +66,9 @@ class FakeElement {
     delete this.attributes[name]
   }
 
+  /** Remove this element from its parent, as the DOM does. */
+  remove() {}
+
   /** The first child, the way the shell's frame exposes its columns. */
   get firstElementChild() {
     return this.children[0] ?? null
@@ -310,6 +313,7 @@ async function loadPlugin(env) {
     run(env.window, env.document)
     const plugin = definition.factory((id) => {
       if (id === 'react') return { createElement: () => ({}) }
+      if (id === 'react-dom') return { createPortal: (children) => children }
       throw new Error(`unexpected require: ${id}`)
     })
     plugin.apply(ctx)

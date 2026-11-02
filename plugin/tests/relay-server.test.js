@@ -164,6 +164,8 @@ class FakeHost {
           platform: 'darwin',
           clientVersion: '1.2.3',
           localBaseUrl,
+          accessKey: this.options.accessKey,
+          passcode: this.options.passcode,
         }),
       ),
     )
@@ -214,6 +216,9 @@ class FakeHost {
    * @param {Record<string, any>} frame
    */
   async answerRequest(frame) {
+    // A stalled path stays unanswered, the way a native folder chooser waits
+    // for a person at the desktop.
+    if (Array.isArray(this.options.stallPaths) && this.options.stallPaths.includes(frame.path)) return
     const body = frame.body ? Buffer.from(frame.body, 'base64') : null
     const target = new URL(frame.path, this.options.localBaseUrl)
     const result = await new Promise((resolve, reject) => {
@@ -317,11 +322,45 @@ async function startRelay(options = {}) {
     token: TOKEN,
     publicBaseUrl: options.publicBaseUrl,
     devicePath: options.devicePath,
+    requestTimeoutMs: options.requestTimeoutMs,
+    interactiveRequestTimeoutMs: options.interactiveRequestTimeoutMs,
     log: () => {},
   })
   const { port } = await relay.listen({ host: '127.0.0.1', port: 0 })
   return { relay, url: `http://127.0.0.1:${port}` }
 }
+
+test('a request that waits for a person at the desktop gets a longer window', async (t) => {
+  const upstream = await startUpstream()
+  const { relay, url } = await startRelay({ requestTimeoutMs: 150, interactiveRequestTimeoutMs: 3_000 })
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const host = await new FakeHost({
+    relayUrl: url,
+    deviceId: 'device-pick',
+    localBaseUrl: upstream.url,
+    stallPaths: ['/api/directoryPicker/pick', '/api/session/list'],
+  }).connect()
+  t.after(() => host.close())
+
+  // An ordinary request the host never answers runs out of time.
+  const ordinary = await fetch(`${url}/api/session/list`)
+  assert.equal(ordinary.status, 504)
+  assert.match(await ordinary.text(), /did not answer in time/)
+
+  // The folder picker waits for a click on the desktop, which can take far
+  // longer than the ordinary window.
+  const pending = fetch(`${url}/api/directoryPicker/pick`)
+  const raced = await Promise.race([
+    pending.then((response) => response.status),
+    new Promise((resolve) => setTimeout(() => resolve('still waiting'), 600)),
+  ])
+  assert.equal(raced, 'still waiting', 'the picker must not be timed out like an ordinary request')
+  await pending.catch(() => {})
+})
 
 test('createRelayServer requires a token', () => {
   assert.throws(() => createRelayServer({}), /token/)
@@ -753,6 +792,30 @@ test('answers 403 once the host revoked the device', async (t) => {
 
   const response = await fetch(`${url}/device-revoked/anything`)
   assert.equal(response.status, 403)
+})
+
+test('a phone without the access key gets a page instead of a download', async (t) => {
+  const upstream = await startUpstream()
+  const { relay, url } = await startRelay()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const host = await new FakeHost({
+    relayUrl: url,
+    deviceId: 'device-nokey',
+    localBaseUrl: upstream.url,
+    accessKey: 'the-access-key',
+    passcode: '12345678',
+  }).connect()
+  t.after(() => host.close())
+
+  const response = await fetch(`${url}/device-nokey/anything`)
+  assert.equal(response.status, 401)
+  assert.match(String(response.headers.get('content-type')), /text\/html/)
+  const body = await response.text()
+  assert.match(body, /访问密钥/)
 })
 
 test('exposes the management api', async (t) => {

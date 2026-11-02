@@ -155,3 +155,150 @@ test('the shell\'s own open and collapse controls are marked on a phone', async 
   // The right sidebar's own button must not be taken for the sidebar's.
   assert.equal(right.getAttribute('data-dsh-sidebar-toggle'), null)
 })
+
+/** Return the single mobile stylesheet's CSS, not its implementation. */
+async function mobileCss() {
+  const { styles } = await loadClient()
+  const style = styles.find((entry) => entry.id === 'dsh-remote-control-mobile-layout')
+  assert.ok(style, 'the mobile layout stylesheet must be injected')
+  return style.textContent
+}
+
+test('the conversation header stays the host\'s own and loses desktop-only controls', async () => {
+  const css = await mobileCss()
+  // The host folds the views it cannot show into a More menu, so the phone
+  // must not take the header over: no height, padding or layout override.
+  assert.doesNotMatch(css, /header\[data-window-drag\]\s*\{[^}]*min-height/s)
+  assert.doesNotMatch(css, /header\[data-window-drag\]\s*\{[^}]*padding/s)
+  assert.match(css, /header\[data-window-drag\] button[^{]*\{[^}]*min-height: 44px !important/s)
+  assert.match(css, /\[data-conversation-tabs\][^{]*\{[^}]*overflow-x: auto !important/s)
+  assert.match(css, /\[data-conversation-tabs\] \[role="tab"\][^{]*\{[^}]*min-height: 44px !important/s)
+  assert.match(css, /\[data-width-handle\][^{]*\{[^}]*display: none !important/s)
+})
+
+test('the desktop-only "open locally" control is gone on a phone', async () => {
+  const css = await mobileCss()
+  // The host opens a file or a folder in an application on the Host desktop:
+  // Finder, VS Code, Xcode, a terminal. A phone is not holding that machine,
+  // so the split button the host marks with `data-open-target` must not be
+  // offered there.
+  assert.match(css, /\[data-open-target\][^{]*\{[^}]*display: none !important/s)
+})
+
+test('the phone chrome stays pinned while the page scrolls', async () => {
+  const css = await mobileCss()
+  // The rail and the conversation header are ordinary flow content: a focused
+  // field that makes the browser scroll the page would take them away.
+  assert.match(css, /\.sa-sidebar[^{]*\{[^}]*position: sticky !important/s)
+  assert.match(css, /\.sa-sidebar[^{]*\{[^}]*height: 100dvh !important/s)
+  assert.match(css, /header\[data-window-drag\][^{]*\{[^}]*position: sticky !important/s)
+  assert.match(css, /header\[data-window-drag\][^{]*\{[^}]*top: 0 !important/s)
+})
+
+test('no editable control on a phone can trigger the focus zoom', async () => {
+  const css = await mobileCss()
+  assert.match(css, /input,\s*textarea,\s*select,\s*\[contenteditable\][^{]*\{[^}]*font-size: 16px !important/s)
+})
+
+test('a phone menu keeps a readable surface', async () => {
+  const css = await mobileCss()
+  const narrow = css.slice(css.indexOf('@media'))
+  // The host's menu surface is painted by a CSS anchor-positioned element that
+  // iOS Safari does not implement yet, so the menu would show the page through
+  // it. A phone needs a surface that does not depend on that feature.
+  assert.match(narrow, /\[data-menu-material\][^{]*\{[^}]*background: var\(--dsw-alias-bg-layer-2\) !important/s)
+  assert.match(narrow, /\[data-menu-material\][^{]*\{[^}]*box-shadow: var\(--dsw-elevation-prominent\) !important/s)
+  assert.match(narrow, /\[data-menu-material\][^{]*\{[^}]*max-width: calc\(100vw - 24px\) !important/s)
+  assert.match(narrow, /\[data-menu-material\][^{]*\{[^}]*overflow-y: auto !important/s)
+})
+
+test('the composer is thumb-sized, readable and safe-area aware', async () => {
+  const css = await mobileCss()
+  assert.match(css, /\[data-composer-input\][^{]*\{[^}]*font-size: 16px !important/s)
+  assert.match(css, /\[data-composer-card\] button[^{]*\{[^}]*min-height: 44px !important/s)
+  // An attachment icon that may shrink turns into an ellipse once the file
+  // name is long; the name is the part that may give way.
+  assert.match(css, /\[data-composer-seat\] :is\(svg, img\)[^{]*\{[^}]*flex: 0 0 auto !important/s)
+  assert.match(css, /\[data-dsh-composer-primary\][^{]*\{[^}]*min-width: 44px !important/s)
+  assert.doesNotMatch(css, /\[data-composer-card\] button\[aria-label\][^{]*\{[^}]*min-width: 44px !important/s)
+  assert.doesNotMatch(css, /\[data-composer-dock\][^{]*\{[^}]*flex-wrap: wrap !important/s)
+  assert.doesNotMatch(css, /\[data-composer-card\] > div:last-child/)
+  assert.match(css, /\[data-composer-seat\][^{]*\{[^}]*padding-bottom: calc\(4px \+ env\(safe-area-inset-bottom, 0px\)\) !important/s)
+})
+
+test('message content cannot create a second horizontal page', async () => {
+  const css = await mobileCss()
+  assert.match(css, /\[data-conversation-content\][^{]*\{[^}]*--dsh-chat-user-width: 100% !important/s)
+  assert.match(css, /\[data-conversation-content\][^{]*\{[^}]*--dsh-composer-side-clearance: 12px !important/s)
+  assert.match(css, /\[data-conversation-scroll\][^{]*\{[^}]*overflow-x: hidden !important/s)
+  assert.match(css, /\[data-conversation-scroll\] pre[^{]*\{[^}]*max-width: 100% !important/s)
+  assert.match(css, /\[data-conversation-scroll\] table[^{]*\{[^}]*overflow-x: auto !important/s)
+  assert.match(css, /\[data-conversation-scroll\] :is\(p, li, h1, h2, h3, h4, h5, h6\)[^{]*\{[^}]*overflow-wrap: anywhere !important/s)
+  assert.match(css, /\[data-conversation-scroll\] :is\(p, li\) code[^{]*\{[^}]*white-space: normal !important/s)
+  assert.match(css, /\[data-conversation-scroll\] :is\(video, canvas, svg\)[^{]*\{[^}]*max-width: 100% !important/s)
+  assert.match(css, /\[data-changes-review\] \[data-review-view\][^{]*\{[^}]*overflow-x: auto !important/s)
+  assert.doesNotMatch(css, /\[data-conversation-scroll\] \[data-review-view\]/)
+})
+
+test('delivery and change cards collapse to one phone column', async () => {
+  const css = await mobileCss()
+  assert.match(css, /\[data-presented-files-row\][^{]*\{[^}]*grid-template-columns: minmax\(0, 1fr\) !important/s)
+  assert.match(css, /\[data-presented-file\][^{]*\{[^}]*min-height: 64px !important/s)
+  assert.match(css, /\[data-changed-files\][^{]*\{[^}]*max-width: 100% !important/s)
+  assert.match(css, /\[data-changed-files\] li[^{]*\{[^}]*min-width: 0 !important/s)
+  assert.match(css, /\[data-changed-files\] li button[^{]*\{[^}]*grid-template-columns: minmax\(0, 1fr\) auto !important/s)
+  assert.match(css, /\[data-changed-files\] li button > span[^{]*\{[^}]*text-overflow: ellipsis !important/s)
+  assert.doesNotMatch(css, /\[data-changed-files\] li button > span:(?:first|last)-child/)
+  assert.match(css, /\[data-changes-review\][^{]*\{[^}]*max-width: 100% !important/s)
+  assert.doesNotMatch(css, /\[data-changes-review\][^{]*\{[^}]*overflow: hidden !important/s)
+  assert.match(css, /\[data-review-file\][^{]*\{[^}]*text-overflow: ellipsis !important/s)
+  assert.match(css, /\[data-review-tool\][^{]*\{[^}]*min-width: 44px !important/s)
+  assert.match(css, /\[data-review-tool\][^{]*\{[^}]*min-height: 44px !important/s)
+})
+
+test('mobile surfaces use theme tokens rather than hard-coded colors', async () => {
+  const css = await mobileCss()
+  assert.doesNotMatch(css, /#[0-9a-f]{3,8}\b/i)
+  assert.match(css, /var\(--dsw-alias-bg-base\)/)
+})
+
+test('only the composer send and stop actions receive the primary marker', async () => {
+  const { document, window } = await loadClient()
+  const mark = window[Symbol.for('dsh.remote-control.mark-composer-controls')]
+  assert.equal(typeof mark, 'function', 'the composer marker helper must be published')
+  const button = (label) => {
+    const attributes = { 'aria-label': label }
+    return {
+      attributes,
+      getAttribute: (name) => attributes[name] ?? null,
+      setAttribute: (name, value) => { attributes[name] = value },
+      removeAttribute: (name) => { delete attributes[name] },
+      hasAttribute: (name) => name in attributes,
+    }
+  }
+  const send = button('Send message')
+  const stop = button('Stop generating')
+  const queue = button('Queue message')
+  const steer = button('Steer message')
+  const commands = button('Add files or run commands')
+  const buttons = [send, stop, queue, steer, commands]
+  document.querySelectorAll = (selector) => {
+    if (selector === '[data-composer-card] button[aria-label]') return buttons
+    if (selector === '[data-dsh-composer-primary]') return buttons.filter((b) => b.hasAttribute('data-dsh-composer-primary'))
+    return []
+  }
+  window.matchMedia = () => ({ matches: true })
+
+  mark(['Send message', 'Stop generating', 'Queue message', 'Steer message'])
+
+  for (const primary of [send, stop, queue, steer]) {
+    assert.equal(primary.getAttribute('data-dsh-composer-primary'), '')
+  }
+  assert.equal(commands.getAttribute('data-dsh-composer-primary'), null)
+
+  window.matchMedia = () => ({ matches: false })
+  mark(['Send message', 'Stop generating', 'Queue message', 'Steer message'])
+  for (const candidate of buttons) {
+    assert.equal(candidate.getAttribute('data-dsh-composer-primary'), null)
+  }
+})

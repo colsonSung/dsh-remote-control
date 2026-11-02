@@ -2,5 +2,9 @@
   "meta": {
     "title": "Remote Control",
     "description": "Control this agent from your phone: scan a QR code, or open the access link on another device."
+  },
+  "share": {
+    "title": "Share this conversation",
+    "description": "Share the conversation that is open with people who are not the owner. Every share is a record of its own: its own link, its own 8-digit passcode and its own permission."
   }
 }

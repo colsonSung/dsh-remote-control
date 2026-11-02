@@ -139,6 +139,7 @@ async function unlock(publicUrl, options = {}) {
   return {
     status: response.status,
     cookies,
+    location: response.headers.get('location') ?? '',
     deviceCookie: cookies
       .map((value) => value.split(';')[0])
       .find((value) => value.startsWith('dsh-device=')),
@@ -157,6 +158,18 @@ test('the phone cookie survives a link opened in another app', async (t) => {
   const session = unlocked.cookies.find((value) => value.startsWith('dsh-rc='))
   assert.ok(session, 'the relay issues a session cookie')
   assert.match(session, /SameSite=Lax/, 'the session travels with a link opened elsewhere')
+})
+
+test('the address bar keeps a link that still works after the unlock', async (t) => {
+  const { publicUrl } = await startRelay(t)
+
+  const unlocked = await unlock(publicUrl, { userAgent: PHONE_UA })
+
+  // The redirect used to drop the access key, so copying the address bar
+  // afterwards produced a link that no browser can open any more.
+  assert.equal(unlocked.status, 303)
+  assert.match(unlocked.location, /\?/, 'the redirect keeps the query')
+  assert.match(unlocked.location, /k=/, 'the access key stays in the link')
 })
 
 test('a phone that lost its cookie continues its own record', async (t) => {

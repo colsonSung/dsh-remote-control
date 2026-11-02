@@ -1,5 +1,5 @@
 /**
- * Host half of `dsh-remote-control`.
+ * Host half of `@local/remote-control`.
  *
  * The plugin mirrors Kimi Code's remote control: the host dials OUT to a relay
  * over two WebSockets, the relay replays a remote phone's HTTP traffic back
@@ -40,6 +40,7 @@ import {
   statePath,
   wasEnabled,
 } from './src/device-store.js'
+import { createShareService } from './src/share-service.js'
 
 /** Cordis plugin name. */
 export const name = 'remote-control'
@@ -144,6 +145,18 @@ export function apply(ctx) {
   const passcode = ensurePasscode()
   const log = (message, extra) => ctx.logger.info(`remote-control: ${message}`, extra ?? {})
 
+  /**
+   * The guest-facing half of session sharing.
+   *
+   * The service owns the guest credential, the project boundary and the guest
+   * routes; this file owns the owner-side API and the relay announcements.
+   */
+  const shares = createShareService({
+    ctx,
+    secret: identity.secret,
+    log: (message, extra) => log(message, extra),
+  })
+
   /** @type {{ enabled: boolean, relay: any, client: any, publicUrl: string | undefined, error: string | undefined }} */
   const state = {
     enabled: false,
@@ -218,6 +231,116 @@ export function apply(ctx) {
   function relayBaseUrl() {
     if (externalRelayUrl.length > 0) return externalRelayUrl
     return state.relay === undefined ? undefined : bundledBaseUrl
+  }
+
+  /**
+   * The origin a guest link is opened on.
+   *
+   * The operator's public address wins, then the origin the relay published
+   * for this device, then the configured relay, then the bundled one. An
+   * empty answer means there is no relay to carry the link, and the share is
+   * created without one.
+   *
+   * @returns {string}
+   */
+  function relayPublicBase() {
+    if (publicAddress.length > 0) return publicAddress.replace(/\/+$/, '')
+    const published = state.publicUrl
+    if (typeof published === 'string' && published.length > 0) {
+      try {
+        return new URL(published).origin
+      } catch {
+        /* a published URL that does not parse is no base at all */
+      }
+    }
+    if (externalRelayUrl.length > 0) return httpOrigin(externalRelayUrl)
+    if (bundledBaseUrl.length > 0) return bundledBaseUrl.replace(/\/+$/, '')
+    return ''
+  }
+
+  /**
+   * The http(s) origin of a relay address.
+   *
+   * The relay is addressed over a WebSocket, but a guest opens a link in a
+   * browser: the link has to be an http(s) URL.
+   *
+   * @param {string} url
+   * @returns {string}
+   */
+  function httpOrigin(url) {
+    const trimmed = url.replace(/\/+$/, '')
+    if (trimmed.startsWith('ws://')) return `http://${trimmed.slice('ws://'.length)}`
+    if (trimmed.startsWith('wss://')) return `https://${trimmed.slice('wss://'.length)}`
+    return trimmed
+  }
+
+  /**
+   * The project directory of one session.
+   *
+   * A share is bound to the directory the session works in, and that
+   * directory never moves: the session's own `cwd` is recorded when the
+   * session is created and is immutable afterwards.
+   *
+   * @param {string} sessionId
+   * @returns {Promise<string | undefined>}
+   */
+  async function shareProjectRoot(sessionId) {
+    const sessions = ctx.get('sessions')
+    const live = sessions?.get?.(sessionId)
+    const liveCwd = live?.header?.cwd
+    if (typeof liveCwd === 'string' && liveCwd.length > 0) return liveCwd
+    const query = ctx.get('sessionQuery')
+    if (query === undefined) return undefined
+    try {
+      const observation = await query.observeSession(sessionId, { projectionMode: 'none' })
+      const cwd = observation?.header?.cwd
+      return typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * The shared sessions the relay routes, as the registration carries them.
+   *
+   * @returns {{ id: string, revoked: boolean }[]}
+   */
+  function shareRelayRows() {
+    return shares.list().map((share) => ({
+      id: share.id,
+      revoked: share.revokedAt !== null && share.revokedAt !== undefined,
+    }))
+  }
+
+  /**
+   * Tell the relay about one shared session.
+   *
+   * @param {string} id
+   * @param {boolean} [revoked]
+   */
+  function publishShareToRelay(id, revoked = false, revokedAt = null) {
+    const client = state.client
+    if (client === undefined) return
+    try {
+      client.publishShare(id, revoked, revokedAt)
+    } catch (error) {
+      log(`could not publish the share: ${String(error)}`)
+    }
+  }
+
+  /**
+   * Tell the relay that one shared session is closed.
+   *
+   * @param {string} id
+   */
+  function revokeShareOnRelay(id, revokedAt = Date.now()) {
+    const client = state.client
+    if (client === undefined) return
+    try {
+      client.revokeShare(id, revokedAt)
+    } catch (error) {
+      log(`could not revoke the share: ${String(error)}`)
+    }
   }
 
   async function listDevices() {
@@ -336,6 +459,9 @@ export function apply(ctx) {
       log: (message) => log(message),
     })
     state.client = client
+    // The registration carries the shared sessions, so a relay that restarted
+    // learns the guest links again.
+    client.setShares(shareRelayRows())
     client.on('status', (next) => {
       state.publicUrl = next.publicUrl
       state.error = next.error
@@ -582,6 +708,60 @@ export function apply(ctx) {
         ensureAccessKey(true)
         return { ok: true, value: await status() }
       }
+      case 'shareCreate': {
+        const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId.trim() : ''
+        if (sessionId.length === 0) return failure('sessionId is required')
+        const permission =
+          payload?.permission === 'write' ? 'write' : payload?.permission === 'read' ? 'read' : ''
+        if (permission.length === 0) return failure('permission must be "read" or "write"')
+        const title =
+          typeof payload?.title === 'string' && payload.title.trim().length > 0
+            ? payload.title.trim()
+            : ((await shares.titleOf(sessionId)) ?? sessionId)
+        const projectRoot = await shareProjectRoot(sessionId)
+        if (projectRoot === undefined) {
+          return failure(`session "${sessionId}" has no project directory to share`)
+        }
+        const record = shares.create({ sessionId, title, permission, projectRoot })
+        publishShareToRelay(record.id, false)
+        const base = relayPublicBase()
+        return {
+          ok: true,
+          value: {
+            id: record.id,
+            link: shares.link(record.id, base),
+            passcode: record.passcode,
+            permission: record.permission,
+            createdAt: record.createdAt,
+            ...(base.length === 0 ? { reason: 'no relay is configured' } : {}),
+          },
+        }
+      }
+      case 'shareList': {
+        const base = relayPublicBase()
+        return {
+          ok: true,
+          value: {
+            shares: shares
+              .list()
+              .map((share) => shares.view(share, { link: shares.link(share.id, base) })),
+          },
+        }
+      }
+      case 'shareDisable': {
+        const id = typeof payload?.id === 'string' ? payload.id.trim() : ''
+        if (id.length === 0) return failure('id is required')
+        if (!shares.disable(id)) return failure(`there is no share "${id}"`)
+        revokeShareOnRelay(id, Date.now())
+        return { ok: true, value: { ok: true } }
+      }
+      case 'shareDelete': {
+        const id = typeof payload?.id === 'string' ? payload.id.trim() : ''
+        if (id.length === 0) return failure('id is required')
+        if (!shares.remove(id)) return failure(`there is no share "${id}"`)
+        revokeShareOnRelay(id, Date.now())
+        return { ok: true, value: { ok: true } }
+      }
       default:
         return failure(`unknown endpoint ${endpoint}`)
     }
@@ -596,6 +776,26 @@ export function apply(ctx) {
       state.error = String(error)
       log(`the tunnel could not be restored: ${String(error)}`)
     })
+  })
+
+  // The guest routes are raw HTTP: the host's own browser session stays out
+  // of them, and the share's passcode is the only credential a guest needs.
+  //
+  // The prefix carries no trailing slash on purpose: the host matches a
+  // prefix route as `pathname === prefix || pathname.startsWith(prefix + '/')`,
+  // so a '/share/' prefix would only ever match '/share//'.
+  ctx.inject(['webServer'], (webServerCtx) => {
+    webServerCtx.effect(
+      () =>
+        webServerCtx.webServer.register({
+          kind: 'prefix',
+          path: '/share',
+          handler: (req, res) => {
+            void shares.handle(req, res)
+          },
+        }),
+      'remote-control: /share',
+    )
   })
 
   ctx.inject(['connection'], (connectionCtx) => {
@@ -662,5 +862,8 @@ export function apply(ctx) {
 
   ctx.effect(() => async () => {
     await stop()
+    // The guest documents keep a timer of their own: they are let go with
+    // the plugin.
+    await shares.dispose?.()
   }, 'remote-control: teardown')
 }

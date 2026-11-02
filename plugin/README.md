@@ -3,9 +3,10 @@
 Drive this agent from your phone: scan the QR code in **Settings → Remote
 Control**, or open the access link on any other device.
 
-The phone loads the *real* Harness web app through a tunnel, so there is no
-phone-specific UI to maintain: sessions, streaming output, tool approvals and
-the composer all work exactly as they do on the desktop.
+The phone loads the *real* Harness web app through a tunnel: sessions,
+streaming output, tool approvals and the composer use the same behavior as on
+the desktop. A small presentation layer adapts that same interface to narrow
+screens; it does not replace any session or transport logic.
 
 ---
 
@@ -109,6 +110,128 @@ browser half finds them by the accessible name the shell gives them (no
 build-hashed class name) and gives them a visible surface and a bigger touch
 target. Their size and place do not change, so the control next to them
 keeps its own position.
+
+### The conversation itself is phone-sized too
+
+The same narrow-screen stylesheet removes the desktop transcript-width drag
+handles and gives the view tabs a thumb-sized target. The view row itself stays
+the host's own: it shows the views that fit and folds the rest into its More
+menu, which is what a phone wants. Messages keep their own components and
+interactions, while code blocks, tables, images and long links are contained
+inside the phone viewport.
+
+The resident composer keeps its draft, attachment, command and approval
+behavior. On a phone its editor uses 16px text to avoid automatic browser zoom,
+its buttons are at least 44px high, and the primary send/stop action also has a
+44px minimum width without forcing every tool to take that width. Its icons
+never shrink either: a long file name used to squeeze the attachment's icon
+into an ellipse. The bottom
+seat preserves its baseline spacing and respects the device safe area.
+Delivered files change from two columns to one; changed-file paths ellipsize
+while their line counts stay visible, and previews keep their own scrolling.
+
+These rules use stable structural attributes such as `data-conversation-content`,
+`data-composer-card` and `data-presented-files-row`, plus Harness theme tokens.
+They do not replace the Conversation, Composer or Deliverables components, and
+they do not add multi-host switching.
+
+### The link in the address bar keeps working
+
+The relay's unlock redirect used to drop the access key, so the URL that stayed
+in the phone's address bar — and in every copy the owner made of it — no longer
+carried a credential. Another browser opening that address got a bare
+`a valid access link is required`, which some browsers offer as a file to
+download instead of showing it.
+
+The redirect now keeps the query, so the address bar holds a link that still
+opens the agent anywhere. A link that arrives without a key gets a small page
+that says what is missing and where to get the real link, instead of a
+downloadable text file.
+
+### The phone chrome stays where it is
+
+The rail and the conversation header are ordinary flow content, so anything
+that makes the browser scroll the page — a focused field when the keyboard
+opens, most of all — takes them off the screen with it. On a phone the rail
+and the header are therefore pinned: the rail keeps its column and its own
+scroll, and the header sticks to the top while the transcript scrolls under it.
+
+The same focus is what makes iOS zoom the page and leave the composer stretched
+across the screen. Every editable control on a phone keeps 16px text, so the
+browser has no reason to zoom in the first place.
+
+### A phone menu keeps its surface on a phone
+
+The app's menus are painted by an element that is positioned with CSS anchor
+positioning — a feature Chrome has and iOS Safari does not implement yet. On a
+phone the surface therefore stayed transparent and the page showed straight
+through the menu, which made it unreadable. On narrow screens the menu now gets
+an opaque surface of its own, a shadow, and a bound to the viewport, so it
+reads as a panel whatever the browser supports.
+
+### A phone can finally boot the app
+
+The web app loads its client modules as one bundle of several megabytes. Pushed
+to the phone in a single burst, that bundle defeats WebKit's HTTP/2 receive
+window: the transfer stalls, the module import never resolves, the boot promise
+never settles, and the phone shows an empty page — while Chrome on the desktop
+is fine. The host therefore sends a large response in 64 KiB frames, and the
+relay hands it to the phone as it arrives. The same copy of the app also reaches
+Safari with `rel="modulepreload"` instead of a classic script preload, which is
+the preload a module import can use.
+
+The first load after a change still walks the bundle over the link, so the page
+can sit on *Loading plugins…* for a while; the response is cacheable, so the
+loads after that are immediate.
+
+### Adding a workspace from the phone needs the desktop too
+
+The folder picker lives on the computer: the phone asks the desktop, and the
+desktop shows the operating system's own chooser. The relay gave the host thirty
+seconds to answer, which is long enough for a request and far too short for a
+person who has to walk over to the computer — the phone reported *Couldn't open
+folder* while the chooser was still waiting. That one route now gets five
+minutes; every other request keeps the ordinary window.
+
+So the flow is: add the workspace on the phone, pick the folder on the computer
+within five minutes, and the phone continues. Without a person at the computer
+there is nothing to pick, and the phone waits until the window ends.
+
+### The composer stays above the phone keyboard
+
+A phone keyboard shrinks the visual viewport but leaves the layout viewport
+alone, so a composer pinned to the bottom of its scroller ends up behind the
+keyboard — the draft is hidden while you type in it. The plugin watches
+`visualViewport`, measures how much of the composer the keyboard actually
+covers, and lifts the composer by exactly that distance. The measurement
+follows the keyboard while it opens, scrolls and closes, and a composer that is
+already fully visible is not moved at all.
+
+The Chinese input method on iOS draws a toolbar of its own above the keyboard.
+It is painted over the page instead of inside the keyboard, so it never shows
+up in the visual viewport, and it would cover the lower half of the composer.
+On iOS the composer therefore keeps that room free as well; the toolbar itself
+stays where the system puts it.
+
+Whether the composer holds the focus decides that, not a measurement: Safari
+scrolls the page to reveal the field, and then nothing of the composer sits
+below the visible area any more — the measurement would report "nothing is
+covered" while the keyboard and its toolbar still cover the screen. With the
+focus in the composer the room is kept; without it, nothing is reserved.
+
+### The Settings panel fits a phone, and a tap never zooms the page
+
+The Settings dialog is a fixed 800px two-column panel on the desktop: a 188px
+section rail beside the content column. On a phone that rail squeezes the
+content into a few words per line, so the panel stacks instead — the section
+rail becomes a horizontally scrolling chip row above a full-width content column
+that scrolls on its own. The rule is written against the panel's own
+`data-shortcut-modal="settings"` marker, so it survives a release.
+
+A phone also zooms when a control below 16px takes focus, and again on a
+double-tap. Form controls therefore use 16px text, and buttons, links and other
+tappables carry `touch-action: manipulation`, so a tap never changes the page
+zoom.
 
 ### A refused session is recovered
 
@@ -321,6 +444,8 @@ Settings navigation next to *General*, *Models*, *Plugins* and *Agent presets*.
 | `src/relay-server.js` | The relay: phone-facing proxy, device channels, management API |
 | `src/relay-client.js` | The host side of the tunnel |
 | `src/device-store.js` | Durable device identity and the shared secret |
+| `src/share-store.js` | Durable share records: the session, the permission, the passcode and the project root |
+| `src/share-service.js` | The guest surface: the routes, the passcode, the cookie, the project boundary |
 | `tools/sync-contract.js` | Writes the wire contract into the browser half and checks it |
 | `tests/` | The test suites: relay unit suites, the tunnel end to end, the compression path |
 | `../remote-control-relay/` | The standalone relay for cloud deployments |
@@ -355,6 +480,317 @@ add a host endpoint.)
 
 ---
 
+## Sharing one session with a guest
+
+The phone is an **owner**: it holds the host's own browser session and can do
+everything the desktop can. A guest is not. A guest gets a link, a passcode and
+exactly one session — and none of the owner's credentials.
+
+So a share is not the app. It is a small, self-contained page of its own that
+serves one conversation, and the guest never becomes a peer of the Harness
+server.
+
+### What the owner gets
+
+The Settings page talks to the same route it already used, with four more
+methods:
+
+| Method | Payload | Answer |
+| --- | --- | --- |
+| `shareCreate` | `{sessionId, permission, title?}` | `{id, link, passcode, permission, createdAt}` |
+| `shareList` | — | `{shares: [{id, sessionId, title, permission, passcode, createdAt, lastUsedAt, revokedAt, link, status}]}` |
+| `shareDisable` | `{id}` | `{ok: true}` — the link stops working, the record stays |
+| `shareDelete` | `{id}` | `{ok: true}` — the record is gone |
+
+`permission` is `read` or `write`. The link is `<relay origin>/s/<id>`; without
+a relay there is no link, and `shareCreate` answers `link: null` with a
+`reason`.
+
+The records live in `remote-control-shares.json` next to `remote-control.json`,
+with mode `0600` — a passcode is a credential:
+
+```json
+{
+  "version": 1,
+  "shares": [
+    {
+      "id": "s_0123456789ab",
+      "sessionId": "…",
+      "title": "The shared session",
+      "permission": "write",
+      "passcode": "12345678",
+      "createdAt": 0,
+      "lastUsedAt": null,
+      "revokedAt": null,
+      "projectRoot": "/absolute/path/to/project"
+    }
+  ]
+}
+```
+
+### What the guest gets
+
+The guest routes are raw HTTP under `/share/`, registered with
+`ctx.webServer.register(...)`. They carry **no** host authentication: the
+share's passcode is the only credential, and the host's own session cookie
+never reaches them.
+
+| Route | What it does |
+| --- | --- |
+| `GET /share/<id>` | The guest page. Locked it asks for the passcode, open it shows the conversation |
+| `POST /share/<id>/unlock` | Checks the passcode and sets the guest cookie |
+| `GET /share/<id>/api/state` | `{share, session, messages}` |
+| `GET /share/<id>/api/stream` | The live events, as Server-Sent Events |
+| `POST /share/<id>/api/message` | Puts a message into the session — `write` shares only |
+| `GET /share/<id>/api/tree?path=` | Lists one directory of the project root |
+| `GET /share/<id>/api/trajectory` | The steps of the conversation, as the host's Trajectory tab shows them |
+| `GET /share/<id>/api/context` | The files the conversation produced |
+| `GET /share/<id>/api/file?path=` | Reads one file inside the project root |
+| `GET /share/<id>/api/blob?path=` | Reads one image of the project as bytes |
+| `GET /share/<id>/api/asset?name=mermaid` | The mermaid library, for the documents that carry a diagram |
+| `GET /share/<id>/api/room` | Who is in the room, and what each of them holds |
+| `POST /share/<id>/api/room` | A guest says who it is, what it has open, whether it holds it |
+| `POST /share/<id>/api/edit` | A guest puts its text into a file — refused when the file moved on |
+| `POST /share/<id>/api/collab` | The collaborative document of a file: open it, change it, move the cursors |
+
+### The guest page is the app, scoped
+
+The page is the Harness conversation seen from the outside: the rail, the
+shared conversation beside it, the **Chat / Trajectory / Context** tabs of the
+host's own conversation, and — beside them — the files of the task's project
+folder. A phone gets the same page without the side column.
+
+What it does **not** have is the app behind it: the guest's browser never
+receives the host's session cookie, so there is no session list, no workspace
+switcher, no tool approvals and no other conversation to reach. The host's
+`/api` is never exposed to a guest.
+
+The transcript comes from the session's **durable log**
+(`ctx.sessionPersistence.open(id, 'read')`), not from the live session view: a
+live session's own view carries only its latest state, while the log holds the
+whole conversation the owner shared. The title comes from the same log, in its
+`session/title` event.
+
+A tool result is a step of the agent's work, not a message of the
+conversation: in the transcript it collapses into one line, and the Trajectory
+tab carries the steps themselves.
+
+### The visitor chooses the theme: the page follows their system until they
+say otherwise, and the choice stays where they left it. The dark palette
+is written once and serves both the system and the button, so the two
+never drift apart.
+
+The panel that holds a file takes the whole page and gives it back: a
+button in its header, and the escape key.
+
+The page wears the app's colours and the app's type: the values of the
+transcript - a body of 13px on a 23px line in a column of 742px - and the
+shape of the composer - a card with a ring around it, an input that grows
+with the text and a send button that is a circle of the accent colour -
+are the ones measured from the running host, not chosen by eye.
+
+The page wears the app's colours
+
+The guest page stands outside the app, so it carries the palette itself — but
+the values are the app's, measured from the running host: the accent is
+`#4176e6` in light and `#7aaaff` in dark, the text and the surfaces are the
+app's, and the page follows the **visitor's** system theme, since the guest's
+browser is not the owner's. The surfaces are a ramp of their own: the app's
+light surfaces are all `#ffffff`, so a card that used them would be white on
+white.
+
+The scrollbars of the page are thin and out of the way: they appear when
+the area they belong to is under the pointer.
+
+A diagram of a document is drawn when it comes into view, not before: the
+library is five megabytes and it comes in the background while the guest
+reads. The diagram wears the palette of the page — the accent of the page
+is the border of the nodes — so it reads as part of the document rather
+than as a picture of another one.
+
+The conversation reads as the app's own transcript: what was asked and
+what the agent answered. A question is a question - the owner's, a
+guest's, a teammate's closing message - and it is rendered like the
+answer: the guest reads the message as it was written, not as its
+source. The host clips a message only far beyond what a reply holds,
+and the cut falls on a line, so a paragraph never ends in the middle of
+a word. The steps of the agent's work are plumbing, so
+they gather into one folded group - "5 tool calls" - that opens when the
+guest wants to see them; a step carries its name ("Read
+remote-control/client.js", "Run a command") on a line of its own, and
+its detail folds away under it. The tool result names the call it belongs to, so the live stream
+lends the call's title to the result that follows. The agent
+writes Markdown, so the guest sees Markdown - headings, lists, tables,
+code - and never the source of it. A message that is a whole HTML document opens in the sandbox
+of the file panel instead. A relative path in a message names a file of
+the project, and the guest opens it in the panel.
+
+The panel is the guest's own width: they drag its edge, and the width
+stays where they left it. The conversation steps aside for it, and on a
+phone the panel takes the whole screen. The files column beside the
+conversation folds away and opens again, and it takes a width of its own
+the same way.
+
+An HTML document opens in a sandbox that lets the document run its own
+scripts and answer a click, but gives it no same origin: it cannot reach
+the guest's session, its storage or the page around it.
+
+A document that carries a mermaid diagram is drawn as one. The library is
+five megabytes, so it arrives only when a document asks for a diagram:
+the host serves it through `GET /share/<id>/api/asset?name=mermaid`,
+behind the same passcode gate as the other guest routes, cached for a
+day. A host without the library keeps the code as code.
+
+The files the guest reads are coloured, by the language their extension names:
+`src/share-highlight.js` holds the highlighter, and it is a plain function
+without a closure — the page injects its own source into the browser and the
+tests run it here. It escapes the text before it colours it, so a file can
+never write markup into the page.
+
+The guest cookie is `dsh-share-<id>`, and its value is
+`<issuedAt>.<HMAC-SHA256(device secret, "share:<id>:<issuedAt>")>` in base64url.
+The timestamp travels with the HMAC because the HMAC covers it: a guest cannot
+move it, and the server needs it to know how old the cookie is. The cookie is
+`HttpOnly`, `SameSite=Lax`, `Path=/share/<id>` and lives for a day.
+
+Five wrong passcodes lock the caller out for ten minutes. The lock belongs to
+the caller — the relay forwards the phone's address in `x-forwarded-for`, so a
+stranger cannot lock the owner out of their own link.
+
+### The room of a share
+
+A share is a room. The Host serves the event stream of every guest, so it is
+already the one place where the guests of a share meet: each of them says
+what it has open, and the Host hands every change to all of them.
+
+Three things keep the guests out of each other's way:
+
+- **A file belongs to one guest at a time.** A guest that takes a file for
+  editing holds it, and the others are told who holds it.
+- **A save is guarded.** The file travels with its version, and the Host
+  writes with that version in hand: when the file moved on — the agent's
+  work, most of the time — the save is refused, the guest keeps its text and
+  is shown what the file holds now.
+- **A file that changes is read again.** The Host watches the files the
+  guests have open, and a guest that looks at a file sees it change under
+  them instead of working on a text that is no longer there.
+
+### The queue of a conversation
+
+The Host digests the messages of a conversation one at a time: the agent works
+on one message, and the messages that arrive while it works wait behind it.
+The plugin keeps that queue itself — the Host does not tell a plugin what is
+waiting, and the Host cuts a message when several of them wait at the same
+time (see `docs/bugs/2026-11-02-queued-user-prompts-are-truncated.md`).
+
+So the message of a guest is **queued**, not delivered:
+
+- `POST /share/<id>/api/message` puts the message in the queue and answers
+  `{ ok: true, queued: true, id, position }`. The composer of the guest clears
+  at once, and the message appears in the transcript when the Host records it.
+- The queue hands the Host **one message at a time**: the next message waits
+  until the turn of the agent has ended, so the Host never holds more than one
+  message waiting and a message is never cut on its way in.
+- The queue is told to every guest of the share at the same moment. The bar
+  above the composer says what the agent works on, what waits behind it, and
+  whose words those are — a guest sees their own message waiting.
+
+The queue reads the turn boundaries of the shared session (`turn/start` and
+`turn/end`) out of the event stream it already follows, so it knows when the
+agent is free without asking the agent anything. A message the agent does not
+take within a minute is let go, and the queue moves on: a guest waits for the
+agent, never forever.
+
+### The guests edit one document together
+
+A file the guests edit together is a **document**: every guest holds the same
+one, every change of one guest reaches the others, and the cursors travel
+with it. The document is a CRDT (Yjs), so two guests may write the same
+place at the same moment without either of them losing the other's text.
+
+The Host keeps the document, because the Host is where the guests of a share
+meet. The library travels to the browser as one file the Host serves
+(`GET /share/<id>/api/asset?name=yjs`), the same way the diagram library does.
+
+The document is written to the file when the guests stop typing, and the
+write is guarded by the version the text was based on: when the agent wrote
+the file in the meantime, the write is refused, the document starts again
+from the file as it is now, and the guests are told that what they had was
+set aside. The agent never joins the document — it is not a CRDT — so the
+guard, not a merge, is what keeps the two apart.
+
+### The history of a conversation
+
+Every share is a record of its own, and the records stay: the Settings page
+lists the shares of **every** conversation, with the state of each link
+(active or revoked), and the Share dialog carries a **History** button that
+shows the shares of the conversation at hand — every link, every passcode,
+every permission, and whether the link still works.
+
+### A guest annotates a document
+
+The guest of a shared conversation picks a passage of a document, writes
+what has to change there, and the model is asked for the wording of the
+annotation. The guest reads the draft and sends it into the conversation
+when the wording is right — with the file, the passage and the
+annotation, so the agent knows what is being talked about.
+
+The drafting is the one of the Markdown preview plugin, moved here so
+that a guest may use it too: the Host owns the model, the page only
+speaks HTTP to it.
+
+### A guest may send a picture or a file
+
+The composer of the guest carries a paperclip. A picture goes into the
+message as it is, and the Host keeps it; any other file is uploaded first
+and the receipt of that upload goes into the message. A file the Host
+will not take does not take the message with it: the words still arrive.
+
+### The project boundary is the plugin's job
+
+The host does **not** confine a plugin's file reads: `ctx.workspaceFiles` reads
+whatever the filesystem can reach, and the sandbox policy governs the agent's
+tool calls, not the plugin's own code. The share therefore resolves every guest
+path itself:
+
+1. a guest path is always **relative** to the project root — an absolute path
+   is refused outright;
+2. `ctx.fs.lstat(path, {cwd: root})` looks at the path *before* the resolution
+   follows its last component, so a symlink is seen as a symlink;
+3. `ctx.fs.resolve(path, {cwd: root})` turns the path into the filesystem's own
+   identity, resolving the ancestors as well;
+4. `ctx.fs.contains(root, target)` compares that identity with the root's, by
+   path segment — so a directory that merely starts with the root's name is
+   outside it;
+5. the size is capped.
+
+Every failure answers `403` and says nothing about whether the path exists. The
+root is the session's own `cwd`, snapshotted when the share was created; a
+session's directory never moves afterwards.
+
+### The relay hears about the shares
+
+The management channel carries two new frames:
+
+```
+{ type: 'share_publish', share_id, device_id, revoked }
+{ type: 'share_revoke',  share_id, device_id }
+```
+
+and the `register` frame carries `shares: [{id, revoked}]`, so a relay that
+restarted learns the guest links again.
+
+A guest request never receives the launch token, and a refused guest session is
+never retried with one: the token is the owner's credential, and a guest that
+could trade it in would be the owner.
+
+### The relay serves the link
+
+The relay routes `/s/<id>` to the device and forwards it to the host as
+`/share/<id>`.
+
+---
+
 ## Security notes
 
 * The shared secret is stored with mode `0600` under the profile directory
@@ -366,5 +802,11 @@ add a host endpoint.)
   therefore an **owner** peer: it can do everything the desktop can. That
   matches Kimi Code's model (the phone is the account holder), and it is why
   the link must not be shared.
+* A share is **not** an owner: the guest cookie is signed with the device
+  secret and carries no host credential. The guest sees one session, and the
+  files it may read are confined to that session's project directory by the
+  plugin.
+* The share records carry the passcodes in the clear, so the file is `0600`
+  and lives beside the device secret.
 * A relay deployment should sit behind TLS. Plain HTTP leaks the session
   cookie to anyone on the path.
