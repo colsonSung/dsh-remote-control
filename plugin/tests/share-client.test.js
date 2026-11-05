@@ -382,6 +382,52 @@ function fakeDocument() {
 }
 
 /**
+ * A stream of frames, as the browser reads it.
+ *
+ * The room of the owner is a long answer that never ends: the test pushes
+ * the frames into it and the widget reads them as they arrive.
+ *
+ * @returns {any}
+ */
+function fakeStream() {
+  const encoder = new TextEncoder()
+  /** @type {string[]} */
+  const chunks = []
+  /** @type {((chunk: any) => void)[]} */
+  const waiters = []
+  const wake = () => {
+    for (const waiter of waiters.splice(0)) {
+      if (chunks.length > 0) waiter({ done: false, value: encoder.encode(chunks.shift()) })
+      else waiter({ done: true, value: undefined })
+    }
+  }
+  return {
+    /**
+     * Hand one frame to the reader.
+     *
+     * @param {string} text
+     */
+    push(text) {
+      chunks.push(text)
+      wake()
+    },
+    getReader() {
+      return {
+        read() {
+          if (chunks.length > 0) {
+            return Promise.resolve({ done: false, value: encoder.encode(chunks.shift()) })
+          }
+          // The reader waits for the next frame. It does not poll: a poll
+          // would keep the test running after it is done.
+          return new Promise((resolve) => { waiters.push(resolve) })
+        },
+        async cancel() {},
+      }
+    },
+  }
+}
+
+/**
  * A Host route that answers the methods of the shared conversation API.
  *
  * @param {Record<string, any>} routes the answer of every method
@@ -389,8 +435,22 @@ function fakeDocument() {
  */
 function fakeFetch(routes) {
   const calls = []
+  /** @type {Map<string, any>} */
+  const streams = new Map()
   const impl = async (url, init) => {
-    const body = JSON.parse(init.body)
+    const raw = init?.body
+    if (raw === undefined) {
+      // A request without a body: the room of the owner, as a stream.
+      calls.push({ url, method: 'GET', payload: undefined })
+      const key = String(url)
+      let stream = streams.get(key)
+      if (stream === undefined) {
+        stream = fakeStream()
+        streams.set(key, stream)
+      }
+      return { status: 200, ok: true, body: stream }
+    }
+    const body = JSON.parse(raw)
     calls.push({ url, method: body.method, payload: body.payload })
     const route = routes[body.method]
     if (route === undefined) {
@@ -403,6 +463,18 @@ function fakeFetch(routes) {
     return { status: 200, json: async () => answer }
   }
   impl.calls = calls
+  impl.streams = streams
+  /**
+   * Hand one frame of the room of the owner to the browser.
+   *
+   * @param {any} frame
+   */
+  impl.push = (frame) => {
+    for (const [url, stream] of streams) {
+      if (!url.includes('/presence')) continue
+      stream.push(`data: ${JSON.stringify(frame)}\n\n`)
+    }
+  }
   return impl
 }
 
@@ -464,7 +536,13 @@ async function loadPlugin(options = {}) {
         return () => {}
       },
       bind(namespace) {
-        return (key) => dictionaries[namespace]?.[language]?.[key] ?? key
+        // The real locale fills the words of a template: the count of the
+        // guests and the name of the one that writes go into the sentence.
+        return (key, params) => {
+          const template = dictionaries[namespace]?.[language]?.[key] ?? key
+          if (params === undefined) return template
+          return template.replace(/\{(\w+)\}/g, (match, name) => (name in params ? String(params[name]) : match))
+        }
       },
     },
     slots: {
@@ -571,6 +649,34 @@ function componentOf(plugin, slot) {
   const entry = plugin.registrations.find((row) => row.registration.name === slot)
   assert.ok(entry, `the plugin must register something in ${slot}`)
   return entry
+}
+
+/**
+ * The widget that shows who is in the shared conversation.
+ *
+ * @param {any} plugin
+ * @returns {any}
+ */
+function presenceOf(plugin) {
+  const entry = plugin.registrations.find((row) => row.registration.id === 'remote-control-presence')
+  assert.ok(entry, 'the plugin must show the presence of the guests')
+  return entry
+}
+
+/**
+ * Render the widget that shows who is in the shared conversation.
+ *
+ * @param {any} plugin
+ * @returns {any}
+ */
+function renderPresence(plugin) {
+  const entry = presenceOf(plugin)
+  const useSessions = fakeSessions(plugin.sessions)
+  return plugin.renderer.render(plugin.react.createElement(entry.component, {
+    sessionId: 's1',
+    useSessions,
+    t: plugin.t,
+  }))
 }
 
 /**
@@ -1099,6 +1205,145 @@ test('the history of a conversation can delete a share', async () => {
     assert.match(source, /call\('shareDelete'/, 'the delete removes the record')
     assert.match(source, /shareDeleteConfirm/, 'the delete asks first')
     assert.match(source, /setHistory\(\(current\) => current\.filter/, 'the row leaves the panel')
+  } finally {
+    plugin.restore()
+  }
+})
+
+/* The room of the owner --------------------------------------------------- */
+
+test('the conversation header carries the people who are in the shared conversation', async () => {
+  const plugin = await loadPlugin()
+  try {
+    const entry = presenceOf(plugin)
+    assert.equal(entry.registration.name, 'conversation.session.header.utilities')
+    // The widget sits past the button that shares the conversation: it is in
+    // the far right corner of the conversation.
+    const share = componentOf(plugin, 'conversation.session.header.utilities')
+    assert.ok(entry.registration.order > share.registration.order, 'the presence is right of the share button')
+
+    renderPresence(plugin)
+    await tick()
+
+    const asked = plugin.fetch.calls.find((call) => String(call.url).includes('/presence'))
+    assert.ok(asked, 'the owner asks the host for the room of the conversation')
+    assert.match(String(asked.url), /sessionId=s1/, 'the owner asks for the room of its own conversation')
+  } finally {
+    plugin.restore()
+  }
+})
+
+test('the owner sees who is in the shared conversation', async () => {
+  const plugin = await loadPlugin()
+  try {
+    renderPresence(plugin)
+    await tick()
+
+    // The room is empty: the widget has nothing to say.
+    assert.equal(findByAttr(plugin.renderer.root, 'data-rc-presence'), null, 'nobody is in the room yet')
+
+    plugin.fetch.push({
+      kind: 'presence',
+      sessionId: 's1',
+      guests: [{ id: 'g_ada', name: 'Ada', color: '#4176e6', typing: false }],
+      locks: [],
+    })
+    await tick()
+    await tick()
+
+    const widget = findByAttr(plugin.renderer.root, 'data-rc-presence')
+    assert.ok(widget, 'the widget shows that somebody is there')
+    const markup = toMarkup(plugin.renderer.root)
+    assert.match(markup, /Ada/, 'the owner sees the name of the guest')
+    assert.match(markup, /rc-presence-face/, 'the guest has a face')
+    assert.match(markup, /1 guest here/, 'the owner sees how many are there')
+  } finally {
+    plugin.restore()
+  }
+})
+
+test('the owner sees who is writing', async () => {
+  const plugin = await loadPlugin()
+  try {
+    renderPresence(plugin)
+    await tick()
+
+    plugin.fetch.push({
+      kind: 'presence',
+      sessionId: 's1',
+      guests: [{ id: 'g_ada', name: 'Ada', color: '#4176e6', typing: true, typingAt: Date.now() }],
+      locks: [],
+    })
+    await tick()
+    await tick()
+
+    const widget = findByAttr(plugin.renderer.root, 'data-rc-presence')
+    assert.ok(widget, 'the widget is there')
+    assert.equal(widget.props['data-rc-presence-typing'], 'true', 'the widget says that somebody is writing')
+    const markup = toMarkup(plugin.renderer.root)
+    assert.match(markup, /Ada is typing/, 'the owner sees who is writing')
+    assert.match(markup, /rc-presence-dots/, 'the sign of a guest that writes is drawn')
+  } finally {
+    plugin.restore()
+  }
+})
+
+test('the widget of the room is folded away, and a click opens it', async () => {
+  const plugin = await loadPlugin()
+  try {
+    renderPresence(plugin)
+    await tick()
+
+    plugin.fetch.push({
+      kind: 'presence',
+      sessionId: 's1',
+      guests: [
+        { id: 'g_ada', name: 'Ada', color: '#4176e6', typing: false, file: 'docs/plan.md', editing: false },
+        { id: 'g_bob', name: 'Bob', color: '#0f8a8a', typing: true, typingAt: Date.now(), file: '', editing: false },
+      ],
+      locks: [],
+    })
+    await tick()
+    await tick()
+
+    // The header of a conversation is the app's own: the widget is a small
+    // pill of faces until the owner asks for the names.
+    const pill = findByAttr(plugin.renderer.root, 'data-rc-presence')
+    assert.ok(pill, 'the pill of the guests is in the header')
+    assert.equal(pill.props['data-rc-presence-open'], 'false', 'the widget is folded away')
+    assert.equal(pill.props['aria-expanded'], 'false', 'the pill says that it is closed')
+    assert.equal(findByAttr(plugin.renderer.root, 'data-rc-presence-panel'), null, 'the panel is not there yet')
+
+    pill.props.onClick()
+
+    const panel = findByAttr(plugin.renderer.root, 'data-rc-presence-panel')
+    assert.ok(panel, 'the click opens the panel')
+    const markup = toMarkup(plugin.renderer.root)
+    assert.match(markup, /Ada/, 'the panel names the guests')
+    assert.match(markup, /Bob/, 'the panel names every guest')
+    assert.match(markup, /docs\/plan\.md/, 'the panel says what a guest has open')
+    assert.equal(
+      findByAttr(plugin.renderer.root, 'data-rc-presence').props['aria-expanded'],
+      'true',
+      'the pill says that it is open',
+    )
+
+    // A second click folds the panel away again.
+    findByAttr(plugin.renderer.root, 'data-rc-presence').props.onClick()
+    assert.equal(findByAttr(plugin.renderer.root, 'data-rc-presence-panel'), null, 'the panel folds away again')
+  } finally {
+    plugin.restore()
+  }
+})
+
+test('the widget of the room is drawn in the style of the app', async () => {
+  const plugin = await loadPlugin()
+  try {
+    const css = plugin.document.getElementById('dsh-remote-control-share-styles')?.textContent ?? ''
+    assert.match(css, /\.rc-presence\{/, 'the widget has a style of its own')
+    assert.match(css, /\.rc-presence-panel\{/, 'the panel has a style of its own')
+    assert.match(css, /@keyframes rc-presence-blink/, 'the sign of a guest that writes travels')
+    assert.match(css, /prefers-reduced-motion/, 'the travel of the dots may be stopped')
   } finally {
     plugin.restore()
   }

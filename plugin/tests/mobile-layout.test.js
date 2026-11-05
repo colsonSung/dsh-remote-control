@@ -37,8 +37,18 @@ function fakeDocument() {
       return node
     },
   }
+  // The remote marker is written on the document element, before the shell
+  // renders anything, so the fake document has to carry one.
+  const rootAttributes = {}
+  const documentElement = {
+    setAttribute: (name, value) => { rootAttributes[name] = String(value) },
+    getAttribute: (name) => rootAttributes[name] ?? null,
+    removeAttribute: (name) => { delete rootAttributes[name] },
+    hasAttribute: (name) => name in rootAttributes,
+  }
   const document = {
     head,
+    documentElement,
     getElementById(id) {
       return styles.find((style) => style.id === id) ?? null
     },
@@ -46,7 +56,7 @@ function fakeDocument() {
       return { tagName: String(tagName).toUpperCase(), id: '', textContent: '' }
     },
   }
-  return { document, styles }
+  return { document, styles, documentElement }
 }
 
 /**
@@ -54,18 +64,25 @@ function fakeDocument() {
  *
  * @returns {Promise<{styles: any[], window: any}>}
  */
-async function loadClient() {
-  const { document, styles } = fakeDocument()
+async function loadClient(options = {}) {
+  const { document, styles, documentElement } = fakeDocument()
   const originalWindow = globalThis.window
   const originalDocument = globalThis.document
-  globalThis.window = { __ModuleLoader__: { load() {} } }
+  globalThis.window = {
+    __ModuleLoader__: { load() {} },
+    location: {
+      hostname: options.hostname ?? '127.0.0.1',
+      protocol: options.protocol ?? 'http:',
+      search: '',
+    },
+  }
   globalThis.document = document
   try {
     // The file registers a factory and runs its bundle-level installers.
     const source = await readFile(clientPath, 'utf8')
     const run = new Function('window', 'document', `${source}\n//# sourceURL=client.js`)
     run(globalThis.window, document)
-    return { styles, window: globalThis.window, document }
+    return { styles, window: globalThis.window, document, documentElement }
   } finally {
     if (originalWindow === undefined) delete globalThis.window
     else globalThis.window = originalWindow
@@ -100,7 +117,10 @@ test('the stylesheet is injected once', async () => {
   const { document, styles } = fakeDocument()
   const originalWindow = globalThis.window
   const originalDocument = globalThis.document
-  globalThis.window = { __ModuleLoader__: { load() {} } }
+  globalThis.window = {
+    __ModuleLoader__: { load() {} },
+    location: { hostname: '127.0.0.1', search: '' },
+  }
   globalThis.document = document
   try {
     const source = await readFile(clientPath, 'utf8')
@@ -210,6 +230,34 @@ test('a phone menu keeps a readable surface', async () => {
   assert.match(narrow, /\[data-menu-material\][^{]*\{[^}]*box-shadow: var\(--dsw-elevation-prominent\) !important/s)
   assert.match(narrow, /\[data-menu-material\][^{]*\{[^}]*max-width: calc\(100vw - 24px\) !important/s)
   assert.match(narrow, /\[data-menu-material\][^{]*\{[^}]*overflow-y: auto !important/s)
+  // The host measures the room a menu has above its anchor and writes it down
+  // as an inline max-height. A fixed share of the screen ignores that
+  // measurement, and the menu then reaches over the top of the display: the
+  // first entries, the file picker among them, are out of reach.
+  assert.doesNotMatch(narrow, /\[data-menu-material\][^{]*\{[^}]*max-height:/s)
+})
+
+test('the shell follows the visible area of the phone', async () => {
+  const css = await mobileCss()
+  const narrow = css.slice(css.indexOf('@media'))
+  // The composer is sticky at the bottom of the shell's own scroller, so a
+  // shell sized to the visible area puts the composer on the top edge of the
+  // keyboard without measuring or moving it.
+  assert.match(narrow, /#root[^{]*\{[^}]*height: var\(--dsh-vv-height, 100%\) !important/s)
+  assert.match(narrow, /#root[^{]*\{[^}]*margin-top: var\(--dsh-vv-offset, 0px\) !important/s)
+  // The page itself must not scroll: Safari scrolls it to reveal a focused
+  // field, and a scrolled page moves the shell out of the visible area.
+  assert.match(narrow, /html, body[^{]*\{[^}]*overflow: hidden !important/s)
+  // The composer is never moved with a transform: a transformed element is
+  // measured after the transform, so the measurement of the keyboard would
+  // read the lift of the previous round and feed it back.
+  assert.doesNotMatch(narrow, /\[data-composer-seat\][^{]*\{[^}]*transform:/s)
+  assert.doesNotMatch(narrow, /\[data-composer-seat\][^{]*\{[^}]*will-change: transform/s)
+})
+
+test('a dropdown of the composer takes the room of the text field', async () => {
+  const css = await mobileCss()
+  assert.match(css, /\[data-composer-seat\]:has\(\[data-trigger-menu\]\) \[data-input-scroll\][^{]*\{[^}]*display: none !important/s)
 })
 
 test('the composer is thumb-sized, readable and safe-area aware', async () => {
@@ -301,4 +349,32 @@ test('only the composer send and stop actions receive the primary marker', async
   for (const candidate of buttons) {
     assert.equal(candidate.getAttribute('data-dsh-composer-primary'), null)
   }
+})
+
+test('a remote page is marked, and its desktop-only controls are hidden', async () => {
+  const { documentElement, styles } = await loadClient({ hostname: 'rc.example.com' })
+  assert.equal(documentElement.getAttribute('data-dsh-remote'), 'true', 'a remote origin must mark the document')
+  const css = styles.find((entry) => entry.id === 'dsh-remote-control-mobile-layout').textContent
+  // The editor hand-off opens an application on the desktop; the Moments float
+  // is a window of the desktop app; the live recorder captures the desktop
+  // microphone. None of them can act on the machine holding the phone.
+  assert.match(css, /html\[data-dsh-remote\] :is\(/s)
+  for (const selector of ['[data-open-target]', '.mm-quick', '.mvm-quick', '.mm-quick-button', '.mvm-quick-button', '[aria-label="Open the Moments float"]', '[aria-label="Start live"]']) {
+    assert.ok(css.includes(selector), `the remote rule must hide ${selector}`)
+  }
+  // The split button's anchor keeps its halves together; hiding only the
+  // halves would leave a gap.
+  assert.match(css, /html\[data-dsh-remote\] :has\(> \[data-open-target\]\)[^{]*\{[^}]*display: none !important/s)
+})
+
+test('the desktop app keeps its desktop-only controls', async () => {
+  const { documentElement } = await loadClient({ hostname: '127.0.0.1' })
+  assert.equal(documentElement.getAttribute('data-dsh-remote'), null, 'a loopback page must not be marked remote')
+})
+
+test('the desktop app is not remote just because it uses its own scheme', async () => {
+  // The app registers `dsh-app:` and can load its own document through it; a
+  // scheme is not a device, so the desktop keeps its desktop-only controls.
+  const { documentElement } = await loadClient({ hostname: 'app', protocol: 'dsh-app:' })
+  assert.equal(documentElement.getAttribute('data-dsh-remote'), null)
 })

@@ -37,9 +37,11 @@ import {
   rememberEnabled,
   rotateSecret,
   secretFingerprint,
+  stateDirectory,
   statePath,
   wasEnabled,
 } from './src/device-store.js'
+import { writeRemoteLog } from './src/remote-log.js'
 import { createShareService } from './src/share-service.js'
 
 /** Cordis plugin name. */
@@ -143,7 +145,13 @@ export function apply(ctx) {
   const identity = ensureIdentity()
   const accessKey = ensureAccessKey()
   const passcode = ensurePasscode()
-  const log = (message, extra) => ctx.logger.info(`remote-control: ${message}`, extra ?? {})
+  const log = (message, extra) => {
+    ctx.logger.info(`remote-control: ${message}`, extra ?? {})
+    // The words of the plugin are also written into a file of their own: the
+    // app keeps its console in memory and writes it into a crash report when
+    // it stops, and a phone that fails at night is not there when it does.
+    writeRemoteLog(stateDirectory(), message, extra)
+  }
 
   /**
    * The guest-facing half of session sharing.
@@ -748,6 +756,13 @@ export function apply(ctx) {
           },
         }
       }
+      case 'shareRoom': {
+        // The room of a conversation: who is in it, and who is writing. The
+        // owner reads it once and then follows the stream of the same room.
+        const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId.trim() : ''
+        if (sessionId.length === 0) return failure('sessionId is required')
+        return { ok: true, value: shares.ownerRoom(sessionId) }
+      }
       case 'shareDisable': {
         const id = typeof payload?.id === 'string' ? payload.id.trim() : ''
         if (id.length === 0) return failure('id is required')
@@ -825,6 +840,47 @@ export function apply(ctx) {
         return () => {}
       }
     }, 'remote-control: /api/remote-control')
+  })
+
+  // The room of a conversation, as a live stream.
+  //
+  // The owner of a conversation does not ask who is in it every now and then:
+  // the stream carries every change of the room, so the browser that holds the
+  // conversation knows who is in it and who is writing at once. The route is
+  // behind the browser session of the owner, like the route above it.
+  ctx.inject(['connection'], (connectionCtx) => {
+    connectionCtx.effect(() => {
+      try {
+        return connectionCtx.connection.fetch.register({
+          path: `${ROUTE}/presence`,
+          methods: ['GET'],
+          requestBody: 'buffered',
+          fetch: async (request) => {
+            const sessionId = new URL(request.url).searchParams.get('sessionId') ?? ''
+            if (sessionId.trim().length === 0) {
+              return Response.json(
+                { ok: false, error: { code: 'remote-control/bad-request', message: 'sessionId is required', details: {} } },
+                { status: 400 },
+              )
+            }
+            const stream = shares.presenceStream(sessionId.trim(), request.signal)
+            return new Response(stream, {
+              status: 200,
+              headers: {
+                'content-type': 'text/event-stream; charset=utf-8',
+                'cache-control': 'no-store',
+                connection: 'keep-alive',
+                'x-accel-buffering': 'no',
+              },
+            })
+          },
+        })
+      } catch (error) {
+        // A reload can apply this plugin twice; the route already exists then.
+        log(`the presence route could not be registered: ${String(error)}`)
+        return () => {}
+      }
+    }, 'remote-control: /api/remote-control/presence')
   })
 
   /**

@@ -73,7 +73,17 @@ function element(tag) {
     setAttribute(name, value) { this.attributes[name] = String(value) },
     getAttribute(name) { return this.attributes[name] ?? null },
     removeAttribute(name) { delete this.attributes[name] },
-    appendChild(child) { this.children.push(child); return child },
+    appendChild(child) { child.parentNode = this; this.children.push(child); return child },
+    getBoundingClientRect() { return { top: 0, left: 0, bottom: 600, right: 400, width: 400, height: 600 } },
+    focus() { this.focused = true },
+    contains(node) {
+      let current = node
+      while (current !== null && current !== undefined) {
+        if (current === this) return true
+        current = current.parentNode ?? null
+      }
+      return false
+    },
     addEventListener(type, handler) { (this.listeners[type] ??= []).push(handler) },
     set innerHTML(value) { if (value === '') this.children = [] },
     get innerHTML() { return '' },
@@ -90,9 +100,15 @@ function element(tag) {
  * @returns {any}
  */
 function findIn(node, selector) {
-  const wanted = String(selector).replace(/^\./, '')
+  const wanted = String(selector)
+  const byClass = wanted.startsWith('.')
+  const name = byClass ? wanted.slice(1) : wanted.toUpperCase()
   for (const child of node.children) {
-    if (String(child.className).split(/\s+/).includes(wanted)) return child
+    if (byClass) {
+      if (String(child.className).split(/\s+/).includes(name)) return child
+    } else if (child.tagName === name) {
+      return child
+    }
     const found = findIn(child, selector)
     if (found !== null) return found
   }
@@ -139,6 +155,11 @@ function parseMarkup(source) {
       if (id !== null) node.id = id[1]
       const cls = /\bclass="([^"]*)"/.exec(attributes)
       if (cls !== null) node.className = cls[1]
+      // The attributes are the state of the page: an offer that is open says
+      // so in an attribute.
+      for (const pair of attributes.matchAll(/([a-zA-Z-]+)="([^"]*)"/g)) {
+        node.setAttribute(pair[1], pair[2])
+      }
       if (/\bhidden\b/.test(attributes)) node.hidden = true
       stack[stack.length - 1].appendChild(node)
       const closed = attributes.trimEnd().endsWith('/')
@@ -164,13 +185,22 @@ function fakeDocument(html) {
     for (const child of node.children) index(child)
   }
   index(root)
+  /** @type {Record<string, Function[]>} */
+  const listeners = {}
   return {
     body: element('body'),
     documentElement: element('html'),
     createElement(tag) { return element(tag) },
     getElementById(id) { return byId.get(id) ?? null },
+    querySelector(selector) { return findIn(root, selector) },
     querySelectorAll() { return [] },
-    addEventListener() {},
+    addEventListener(type, handler) { (listeners[type] ??= []).push(handler) },
+    /**
+     * Say something happened to the page.
+     *
+     * @param {string} type
+     */
+    fire(type) { for (const handler of listeners[type] ?? []) handler({ type }) },
   }
 }
 
@@ -190,6 +220,7 @@ function runGuestPage(options = {}) {
       setItem(key, value) { store.set(key, String(value)) },
     },
     setInterval() { return 0 },
+    clearInterval() {},
     addEventListener() {},
   }
   const requests = []
@@ -199,8 +230,16 @@ function runGuestPage(options = {}) {
     requests.push({ url: target, body })
     const answer = target.endsWith('api/message')
       ? { ok: true, queued: true, id: 'q0a1b2c3', position: 1 }
-      : {}
-    return Promise.resolve({ ok: true, json: () => Promise.resolve(answer) })
+      : target.endsWith('api/tree')
+        ? { ok: true, path: '', entries: [{ name: 'note.md', path: 'note.md', kind: 'file', size: 12 }] }
+        : {}
+    const text = target.includes('api/file?path=') ? 'the text of the file' : ''
+    return Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve(answer),
+      text: () => Promise.resolve(text),
+      headers: { get: () => '' },
+    })
   }
   const streams = []
   class EventSource {
@@ -213,6 +252,9 @@ function runGuestPage(options = {}) {
     addEventListener(type, handler) { (this.listeners[type] ??= []).push(handler) }
   }
   const location = { pathname: '/s/s_0123456789ab' }
+  /** The passage the reader has picked, if any. */
+  let selection = { isCollapsed: true, anchorNode: null, toString: () => '' }
+  window.getSelection = () => selection
   new Function('window', 'document', 'location', 'fetch', 'EventSource', scriptOf(html))(
     window,
     document,
@@ -220,7 +262,49 @@ function runGuestPage(options = {}) {
     fetch,
     EventSource,
   )
-  return { html, document, window, requests, streams }
+  return {
+    html,
+    document,
+    window,
+    requests,
+    streams,
+    /**
+     * The reader picks a passage, or lets it go.
+     *
+     * @param {{ text?: string, node?: any, collapsed?: boolean }} next
+     */
+    setSelection(next) {
+      const text = next.text ?? ''
+      selection = {
+        isCollapsed: next.collapsed === true || text.length === 0,
+        anchorNode: next.node ?? null,
+        toString: () => text,
+        getRangeAt: () => ({
+          getBoundingClientRect: () => ({ top: 40, left: 40, bottom: 60, right: 200 }),
+        }),
+      }
+    },
+    /**
+     * Say that the selection changed.
+     */
+    fireSelection() { document.fire('selectionchange') },
+    /**
+     * Open a file of the project, the way the tree does it.
+     *
+     * @param {string} path
+     */
+    async openFile(path) {
+      // The tree arrives after the page asked for it.
+      await tick()
+      await tick()
+      const tree = document.getElementById('tree')
+      const row = tree.children.find((child) => child.getAttribute('data-path') === path)
+      assert.ok(row !== undefined, 'the file is in the tree')
+      for (const handler of row.listeners.click ?? []) handler({ type: 'click' })
+      await tick()
+      await tick()
+    },
+  }
 }
 
 /**
@@ -302,6 +386,64 @@ test('the guest page carries the highlighter and the palette of the app', () => 
   assert.match(html, /--accent: #4176e6/, 'the light accent is the app\'s')
   assert.match(html, /--accent: #7aaaff/, 'the dark accent is the app\'s')
   assert.match(html, /prefers-color-scheme: dark/, 'the page follows the visitor\'s theme')
+})
+
+test('the guest page carries the viewer of a diagram', () => {
+  const html = pageHtml()
+  // The viewer travels with the page: the page has no build step, and a
+  // drawing is scaled and zoomed in the browser.
+  assert.match(html, /var diagramMath = \(function diagramMathBundle/, 'the arithmetic travels with the page')
+  assert.match(html, /var diagram = \(function diagramRuntime/, 'the viewer travels with the page')
+  // The styles of the viewer are the styles of the page.
+  assert.match(html, /\.dsh-diagram-viewport\s*\{/, 'the viewer has its styles')
+  assert.match(html, /\.dsh-diagram-btn:focus-visible/, 'the controls say where they are')
+  // And a drawing is handed to it once it is drawn.
+  assert.match(html, /diagram\.mount\(holder, svg\)/, 'the drawing is handed to the viewer')
+})
+
+test('the offer of an annotation follows the passage the reader picked', async () => {
+  const page = runGuestPage()
+  await page.openFile('note.md')
+  const host = page.document.querySelector('.file-panel-body')
+  assert.ok(host !== null, 'the panel holds the document')
+  const bar = page.document.getElementById('annotateBar')
+  const panel = page.document.getElementById('annotatePanel')
+
+  // The reader picks a passage: the offer appears — and only the offer. The
+  // panel waits for the reader to say so.
+  page.setSelection({ text: 'a passage of the document', node: host })
+  page.fireSelection()
+  assert.equal(bar.getAttribute('data-open'), 'true', 'the offer appears')
+  assert.equal(panel.getAttribute('data-open'), 'false', 'the panel waits for the reader')
+
+  // The passage is gone: the offer goes with it. An offer that stays over a
+  // document nobody picked is noise.
+  page.setSelection({ collapsed: true })
+  page.fireSelection()
+  assert.equal(bar.getAttribute('data-open'), 'false', 'the offer goes with the passage')
+  assert.equal(panel.getAttribute('data-open'), 'false', 'the panel is closed as well')
+})
+
+test('the annotation panel shows the passage it is about', async () => {
+  const page = runGuestPage()
+  await page.openFile('note.md')
+  const host = page.document.querySelector('.file-panel-body')
+  page.setSelection({ text: 'a passage of the document', node: host })
+  page.fireSelection()
+  const quote = page.document.querySelector('.annotate-quote')
+  assert.ok(quote !== null, 'the panel shows the passage')
+  assert.equal(quote.textContent, 'a passage of the document', 'the passage is the one that was picked')
+})
+
+test('the document follows the panel, and the prose keeps its measure', () => {
+  const html = pageHtml()
+  // A reader who drags the panel open is asking for a wider document: the
+  // column takes the width of the panel.
+  assert.match(html, /\.file-markdown \{[^}]*width: 100%/, 'the document takes the width of the panel')
+  assert.doesNotMatch(html, /\.file-markdown \{[^}]*max-width: 8\d\dpx/, 'the document is not held at a fixed width')
+  // The lines of the prose keep a measure of their own, so that a wide panel
+  // does not make them hard to read.
+  assert.match(html, /\.file-markdown p, \.file-markdown li[^}]*max-width: 72ch/, 'the prose keeps its measure')
 })
 
 test('the script of the guest page parses', () => {
@@ -453,4 +595,82 @@ test('the guest sees its own message as its own', async () => {
   const head = bar.querySelector('.queue-working')
   assert.equal(textOf(head), 'Working on: read the parser — yours', 'the work is the work of the guest')
   assert.equal(head.getAttribute('data-mine'), 'true', 'the work of the guest is marked')
+})
+
+/* The room of the share ---------------------------------------------------- */
+
+test('the page carries the name of the guest and the sign of a guest that writes', () => {
+  const html = pageHtml()
+  assert.match(html, /id="whoamiInput"/, 'the page asks for the name of the guest')
+  assert.match(html, /id="whoamiDot"/, 'the page carries the colour of the guest')
+  assert.match(html, /\.presence-dots/, 'the page draws the sign of a guest that writes')
+})
+
+test('the guest says that it is writing', async () => {
+  const page = runGuestPage({
+    storage: { 'dsh-share-guest-id': 'g_ada', 'dsh-share-guest-name': 'Ada' },
+  })
+  const input = page.document.getElementById('composerInput')
+
+  input.value = 'read the parser'
+  input.listeners.input[0]()
+  await tick()
+
+  const writing = page.requests.find((entry) => entry.body?.action === 'typing')
+  assert.ok(writing !== undefined, 'the guest says that it is writing')
+  assert.equal(writing.body.typing, true, 'the guest is writing')
+  assert.equal(writing.body.id, 'g_ada', 'the words carry the id of the guest')
+
+  // The guest stops writing: the owner of the conversation does not wait for
+  // a guest that will never say that it stopped.
+  input.value = ''
+  input.listeners.input[0]()
+  await tick()
+
+  const said = page.requests.filter((entry) => entry.body?.action === 'typing')
+  assert.equal(said.length, 2, 'the guest says that it stopped as well')
+  assert.equal(said[1].body.typing, false, 'the guest is not writing any more')
+})
+
+test('the guest tells its name to the room', async () => {
+  const page = runGuestPage()
+  const name = page.document.getElementById('whoamiInput')
+  name.value = 'Ada'
+  name.listeners.change[0]()
+  await tick()
+
+  const said = page.requests.find((entry) => entry.body?.name === 'Ada')
+  assert.ok(said !== undefined, 'the room learns the name of the guest')
+  assert.equal(page.window.localStorage.getItem('dsh-share-guest-name'), 'Ada', 'the name stays where it was left')
+})
+
+test('the page shows who is writing', () => {
+  const page = runGuestPage({
+    storage: { 'dsh-share-guest-id': 'g_ada', 'dsh-share-guest-name': 'Ada' },
+  })
+  emit(page, {
+    kind: 'presence',
+    guests: [{ id: 'g_bob', name: 'Bob', typing: true, editing: false, file: '' }],
+    locks: [],
+  })
+
+  const box = page.document.getElementById('presence')
+  assert.equal(box.hidden, false, 'the box is shown')
+  assert.match(textOf(box), /Bob/, 'the guest is named')
+  assert.match(textOf(box), /is typing/, 'the guest is writing')
+  assert.ok(box.querySelector('.presence-dots') !== null, 'the sign of a guest that writes is drawn')
+})
+
+test('the page does not show the guest itself in the room', () => {
+  const page = runGuestPage({
+    storage: { 'dsh-share-guest-id': 'g_ada', 'dsh-share-guest-name': 'Ada' },
+  })
+  emit(page, {
+    kind: 'presence',
+    guests: [{ id: 'g_ada', name: 'Ada', typing: true, editing: false, file: '' }],
+    locks: [],
+  })
+
+  const box = page.document.getElementById('presence')
+  assert.equal(box.hidden, true, 'a guest does not see itself in the room')
 })

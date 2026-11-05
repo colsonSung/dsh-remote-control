@@ -1417,6 +1417,84 @@ test('the guests of a share edit one document, and it reaches the file', async (
   await fixture.server.close()
 })
 
+test('a write that is refused keeps the text of the guest and tells them', async () => {
+  // The session is alive: the stream of the room stays open, and the room
+  // can tell the guest what happened.
+  const fixture = await setup({ permission: 'write', live: true })
+  const { origin, record, project } = fixture
+  const cookie = await unlock(fixture)
+
+  // The guest opens the document of a file.
+  const opened = await request(`${origin}/share/${record.id}/api/collab`, {
+    method: 'POST',
+    headers: { cookie },
+    body: { action: 'open', path: 'inside.txt', client: 11 },
+  })
+  assert.equal(opened.status, 200, 'the guest opens the document')
+
+  // The guest is in the room, and the stream is open: the room can tell the
+  // guest what happened.
+  const joined = await request(`${origin}/share/${record.id}/api/room`, {
+    method: 'POST',
+    headers: { cookie },
+    body: { id: 'guest-1', name: 'Ada', action: 'hello' },
+  })
+  assert.equal(joined.status, 200, 'the guest is in the room')
+  const stream = openStream(`${origin}/share/${record.id}/api/stream`, { headers: { cookie } })
+
+  // The guest types.
+  const Y = await import('yjs')
+  const guest = new Y.Doc()
+  Y.applyUpdate(guest, Buffer.from(opened.json().state, 'base64'))
+  let produced = null
+  guest.on('update', (bytes) => { produced = bytes })
+  guest.getText('content').insert(0, 'a change\n')
+  const changed = await request(`${origin}/share/${record.id}/api/collab`, {
+    method: 'POST',
+    headers: { cookie },
+    body: { action: 'update', path: 'inside.txt', client: 11, update: Buffer.from(produced ?? []).toString('base64') },
+  })
+  assert.equal(changed.status, 200, 'the change is taken')
+
+  // The file moves on under the guest: the agent rewrote it.
+  writeFileSync(join(project.root, 'inside.txt'), 'the agent rewrote this\n')
+
+  // The write is refused, and the guests are told: a text that does not
+  // reach the file without a word is a text that is lost.
+  await waitFor(
+    () => stream.frames().some((frame) => frame.kind === 'collab-save-failed'),
+    'the guests are told that the write was refused',
+  )
+
+  // What the guest wrote is still there: it is not thrown away.
+  const reopened = await request(`${origin}/share/${record.id}/api/collab`, {
+    method: 'POST',
+    headers: { cookie },
+    body: { action: 'open', path: 'inside.txt', client: 11 },
+  })
+  const kept = new Y.Doc()
+  Y.applyUpdate(kept, Buffer.from(reopened.json().state, 'base64'))
+  assert.match(
+    kept.getText('content').toString(),
+    /a change/,
+    'the text of the guest is not thrown away',
+  )
+
+  // And the file holds what the agent wrote: the refused write did not
+  // overwrite the work of the agent.
+  assert.equal(
+    readFileSync(join(project.root, 'inside.txt'), 'utf8'),
+    'the agent rewrote this\n',
+    'the file holds the work of the agent',
+  )
+
+  stream.close()
+  guest.destroy()
+  kept.destroy()
+  await fixture.service.dispose()
+  await fixture.server.close()
+})
+
 test('the yjs bundle travels to the guest', async () => {
   const fixture = await setup()
   const { origin, record } = fixture

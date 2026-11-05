@@ -16,7 +16,7 @@ import { join } from 'node:path'
 
 import { WebSocketServer } from 'ws'
 
-import { createRelayClient } from '../src/relay-client.js'
+import { createRelayClient, sessionCookieName } from '../src/relay-client.js'
 import { createRelayServer } from '../src/relay-server.js'
 
 const RELAY_SECRET = 'relay-secret-value'
@@ -32,17 +32,28 @@ async function startFakeHarness(seen = {}) {
   const sockets = new Set()
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://dsh.invalid')
+    // The session of the browser is named after the authority the server
+    // serves, and the server hands it out with the redirect that follows the
+    // launch token — the way the real one does.
+    const authority = `127.0.0.1:${server.address()?.port ?? 0}`
+    const sessionName = sessionCookieName(authority)
+    const session = String(req.headers.cookie ?? '').includes(`${sessionName}=fake-session`)
     if (url.pathname === '/') {
+      if (session) {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end('<html><body>harness index</body></html>')
+        return
+      }
       if (url.searchParams.get('token') !== LAUNCH_TOKEN) {
         res.writeHead(401, { 'content-type': 'text/plain' })
         res.end('unauthorized')
         return
       }
-      res.writeHead(200, {
-        'content-type': 'text/html',
-        'set-cookie': 'dsh-auth=fake-session; Path=/; HttpOnly',
+      res.writeHead(303, {
+        location: './',
+        'set-cookie': `${sessionName}=fake-session; Path=/; HttpOnly`,
       })
-      res.end('<html><body>harness index</body></html>')
+      res.end()
       return
     }
     if (url.pathname === '/assets/app.js') {
@@ -51,7 +62,7 @@ async function startFakeHarness(seen = {}) {
       return
     }
     if (url.pathname === '/api/session/list') {
-      if (!String(req.headers.cookie ?? '').includes('dsh-auth=fake-session')) {
+      if (!session) {
         res.writeHead(401, { 'content-type': 'text/plain' })
         res.end('unauthorized')
         return
@@ -145,13 +156,18 @@ test('a phone reaches the harness through the relay tunnel', async (t) => {
   assert.ok(typeof publicUrl === 'string' && publicUrl.includes(DEVICE_ID), `public url ${publicUrl}`)
   assert.match(publicUrl, /rc=1/, 'the public url carries the Kimi-style parameters')
 
-  // 1. The phone opens the access URL: the relay strips the device mount, the
-  //    host injects its launch token, and the harness mints a session cookie.
+  // 1. The phone opens the access URL: the relay strips the device mount and
+  //    the host mints the session for it, so the phone gets the app in one
+  //    hop — and gets the session in its own jar, without a redirect to
+  //    follow. A phone without the cookie would be refused on every later
+  //    request, and the app would come up empty.
   const index = await fetch(publicUrl, { redirect: 'manual' })
   assert.equal(index.status, 200, 'the phone receives the harness index')
   assert.match(await index.text(), /harness index/)
   const cookie = index.headers.getSetCookie?.()[0] ?? ''
-  assert.match(cookie, /dsh-auth=fake-session/, 'the harness minted a session cookie for the phone')
+  assert.match(cookie, /dsh-auth-/, 'the phone is given the session the host minted')
+  assert.match(cookie, /Path=\//, 'the cookie is sent with every request of the phone')
+  const session = cookie.split(';')[0]
 
   // 2. The harness app loads its assets by absolute path: the root-level
   //    request must still reach the device.
@@ -162,7 +178,7 @@ test('a phone reaches the harness through the relay tunnel', async (t) => {
   // 3. The phone calls the API with the cookie it received.
   const api = await fetch(new URL('/api/session/list', publicUrl).href, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', cookie: 'dsh-auth=fake-session' },
+    headers: { 'content-type': 'application/json', cookie: session },
     body: JSON.stringify({ type: 'client-request', rpcId: 'r1', method: 'list', payload: {} }),
   })
   assert.equal(api.status, 200)
@@ -174,7 +190,7 @@ test('a phone reaches the harness through the relay tunnel', async (t) => {
   const { WebSocket } = await import('ws')
   const wsUrl = new URL('/api/remote.mux', publicUrl)
   wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:'
-  const socket = new WebSocket(wsUrl.href, { headers: { cookie: 'dsh-auth=fake-session' } })
+  const socket = new WebSocket(wsUrl.href, { headers: { cookie: session } })
   const echoed = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('no echo within 5s')), 5000)
     socket.on('open', () => socket.send('ping'))
@@ -189,6 +205,59 @@ test('a phone reaches the harness through the relay tunnel', async (t) => {
   })
   assert.equal(echoed, 'echo:ping')
   socket.close()
+})
+
+test('a phone whose browser kept no cookie is still answered', async (t) => {
+  const harness = await startFakeHarness()
+  const relayPort = await freePort()
+  const relay = createRelayServer({
+    token: RELAY_SECRET,
+    publicBaseUrl: `http://127.0.0.1:${relayPort}`,
+    log: () => {},
+  })
+  const address = await relay.listen({ host: '127.0.0.1', port: relayPort })
+  if (typeof relay.setPublicBaseUrl === 'function') {
+    relay.setPublicBaseUrl(`http://127.0.0.1:${address.port}`)
+  }
+
+  const client = createRelayClient({
+    relayUrl: `ws://127.0.0.1:${address.port}`,
+    token: RELAY_SECRET,
+    deviceId: DEVICE_ID,
+    alias: 'test-machine',
+    platform: 'darwin',
+    clientVersion: '1.0.0',
+    localBaseUrl: harness.baseUrl,
+    launchToken: LAUNCH_TOKEN,
+    log: () => {},
+  })
+
+  t.after(async () => {
+    await client.stop().catch(() => {})
+    await relay.close().catch(() => {})
+    await harness.close()
+  })
+
+  await client.start()
+  const publicUrl = client.status().publicUrl
+
+  // The phone opens the app, and its browser keeps no cookie: a private
+  // window, a browser that blocks it, or a page that was opened before the
+  // session existed.
+  const index = await fetch(publicUrl, { redirect: 'manual' })
+  assert.equal(index.status, 200)
+
+  // Every later request of the phone must be answered. The host holds the
+  // session and attaches it, so a phone that keeps no cookie is a phone that
+  // sees an empty app — not a phone that is refused.
+  const api = await fetch(new URL('/api/session/list', publicUrl).href, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId: 'r1', method: 'list', payload: {} }),
+  })
+  assert.equal(api.status, 200, 'the phone is answered even without a cookie of its own')
+  const payload = await api.json()
+  assert.equal(payload.sessions[0].id, 'session-1')
 })
 
 test('a public relay only opens to a phone that presents the access key', async (t) => {

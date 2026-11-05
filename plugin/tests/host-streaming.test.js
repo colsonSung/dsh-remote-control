@@ -26,7 +26,7 @@ import { randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import { test } from 'node:test'
-import { gunzipSync } from 'node:zlib'
+import { brotliDecompressSync, gunzipSync } from 'node:zlib'
 
 import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws'
 
@@ -404,7 +404,7 @@ async function waitForLocalSocket(localSockets) {
  * @param {string} localBaseUrl the base URL of the local DSH server
  * @returns {{ client: any, localSockets: FakeLocalSocket[] }}
  */
-function makeHost(relayUrl, localBaseUrl) {
+function makeHost(relayUrl, localBaseUrl, tuning) {
   const { impl, localSockets } = makeWebSocketImpl(localBaseUrl)
   const client = createRelayClient({
     relayUrl,
@@ -417,6 +417,7 @@ function makeHost(relayUrl, localBaseUrl) {
     launchToken: LAUNCH_TOKEN,
     log: () => {},
     WebSocketImpl: impl,
+    ...(tuning || {}),
   })
   return { client, localSockets }
 }
@@ -514,6 +515,66 @@ test('an event stream is answered with a head and a chunked body', async (t) => 
   // Nothing else: the stream is still open, so there is no last chunk yet.
   await new Promise((resolve) => setTimeout(resolve, 150))
   assert.equal(tunnel.find((frame) => frame.type === 'response_chunk' && frame.last === true), undefined)
+})
+
+test('a quiet event stream is kept alive, so the phone keeps its session', async (t) => {
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    if (req.url !== EVENTS_PATH) {
+      res.writeHead(404, { 'content-type': 'text/plain' })
+      res.end('not found')
+      return
+    }
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    })
+    safeWrite(res, 'data: first\n\n')
+    // The stream stays quiet: nobody writes anything for a long time.
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  // The keep-alive is short here, so the test does not have to wait a minute.
+  const { client } = makeHost(relay.url, upstream.url, { keepAliveMs: 120 })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-keepalive',
+        method: 'GET',
+        path: EVENTS_PATH,
+        headers: { accept: 'text/event-stream' },
+        body: null,
+      }),
+    ),
+  )
+
+  await tunnel.next((frame) => frame.type === 'response')
+  const first = await tunnel.next((frame) => frame.type === 'response_chunk')
+  assert.equal(Buffer.from(first.chunk, 'base64').toString('utf8'), 'data: first\n\n')
+
+  // The relay cuts a stream that says nothing for five minutes, and a phone
+  // that only reads the conversation says nothing for a long time. The tunnel
+  // keeps the stream alive with a comment.
+  const keepAlive = await tunnel.next(
+    (frame) => frame.type === 'response_chunk' && Buffer.from(String(frame.chunk), 'base64').toString('utf8').startsWith(':'),
+  )
+  assert.equal(
+    Buffer.from(keepAlive.chunk, 'base64').toString('utf8'),
+    ': keep-alive\n\n',
+    'the keep-alive is a comment of the event stream',
+  )
+  assert.equal(keepAlive.last, false, 'the stream is still open')
 })
 
 test('a streamed response ends with one last chunk', async (t) => {
@@ -634,7 +695,7 @@ test('a large response is streamed in chunks so a phone can consume it', async (
   // The length of a streamed body is unknown, so the head must not claim one.
   assert.equal(head.headers['content-length'], undefined)
   // The body still travels compressed.
-  assert.equal(head.headers['content-encoding'], 'gzip')
+  assert.equal(head.headers['content-encoding'], 'br')
 
   const chunks = []
   for (;;) {
@@ -644,7 +705,7 @@ test('a large response is streamed in chunks so a phone can consume it', async (
   }
   assert.ok(chunks.length > 1, 'a large body travels in more than one chunk')
   const decoded = Buffer.concat(chunks.map((chunk) => Buffer.from(String(chunk.chunk), 'base64')))
-  assert.equal(gunzipSync(decoded).toString('utf8'), payload)
+  assert.equal(brotliDecompressSync(decoded).toString('utf8'), payload)
 })
 
 test('a normal response still takes the buffered and compressed path', async (t) => {
@@ -685,11 +746,11 @@ test('a normal response still takes the buffered and compressed path', async (t)
   assert.equal(response.chunked, undefined)
   assert.equal(response.body_encoding, 'base64')
   // The 9 MB app bundle relies on this compression.
-  assert.equal(response.headers['content-encoding'], 'gzip')
+  assert.equal(response.headers['content-encoding'], 'br')
   const raw = Buffer.from(String(response.body), 'base64')
   assert.equal(Number(response.headers['content-length']), raw.length)
   assert.ok(raw.length < payload.length / 2, `expected a smaller body, got ${raw.length}`)
-  assert.equal(gunzipSync(raw).toString('utf8'), payload)
+  assert.equal(brotliDecompressSync(raw).toString('utf8'), payload)
 
   // Exactly one response frame, no chunks at all.
   await new Promise((resolve) => setTimeout(resolve, 150))

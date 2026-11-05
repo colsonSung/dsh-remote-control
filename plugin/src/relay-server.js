@@ -174,6 +174,25 @@ const INTERACTIVE_REQUEST_TIMEOUT_MS = 300_000
 const INTERACTIVE_REQUEST_PATHS = new Set(['/api/directoryPicker/pick'])
 
 /**
+ * How long a request that carries the app's own data may take.
+ *
+ * The assets are files: the host answers them in a moment. The app's own data
+ * is work — the session list of a busy machine is megabytes of JSON — and the
+ * host needs the time to build it. A phone that asks for it must not be told
+ * "no answer in time" while the host is still working.
+ */
+const LONG_REQUEST_TIMEOUT_MS = 120_000
+
+/**
+ * The paths that carry the app's own data.
+ *
+ * The app speaks to the host under `/api`, and a guest reads the files of the
+ * project under `/share`.
+ */
+const LONG_REQUEST_PREFIXES = ['/api', '/share']
+
+
+/**
  * Accepted shape of a device id (kept path-safe on purpose).
  */
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/
@@ -510,6 +529,7 @@ export function createRelayServer(options = {}) {
     requestTimeoutMs: rawRequestTimeoutMs,
     streamIdleTimeoutMs: rawStreamIdleTimeoutMs,
     interactiveRequestTimeoutMs: rawInteractiveRequestTimeoutMs,
+    longRequestTimeoutMs: rawLongRequestTimeoutMs,
     livenessTimeoutMs: rawLivenessTimeoutMs,
     livenessIntervalMs: rawLivenessIntervalMs,
   } = options || {}
@@ -539,6 +559,10 @@ export function createRelayServer(options = {}) {
       ? Number(rawStreamIdleTimeoutMs)
       : STREAM_IDLE_TIMEOUT_MS
   // How long a request that waits for a person at the desktop may take.
+  const longRequestTimeoutMs =
+    Number.isFinite(rawLongRequestTimeoutMs) && Number(rawLongRequestTimeoutMs) > 0
+      ? Number(rawLongRequestTimeoutMs)
+      : LONG_REQUEST_TIMEOUT_MS
   const interactiveRequestTimeoutMs =
     Number.isFinite(rawInteractiveRequestTimeoutMs) && Number(rawInteractiveRequestTimeoutMs) > 0
       ? Number(rawInteractiveRequestTimeoutMs)
@@ -551,7 +575,12 @@ export function createRelayServer(options = {}) {
    */
   function deadlineFor(path) {
     const pathname = String(path ?? '').split('?')[0]
-    return INTERACTIVE_REQUEST_PATHS.has(pathname) ? interactiveRequestTimeoutMs : requestTimeoutMs
+    if (INTERACTIVE_REQUEST_PATHS.has(pathname)) return interactiveRequestTimeoutMs
+    // The app's own data takes as long as the work takes.
+    for (const prefix of LONG_REQUEST_PREFIXES) {
+      if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return longRequestTimeoutMs
+    }
+    return requestTimeoutMs
   }
 
   /** @type {Map<string, any>} */

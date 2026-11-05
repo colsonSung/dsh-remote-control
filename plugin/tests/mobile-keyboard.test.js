@@ -2,9 +2,16 @@
  * The composer must stay above the phone keyboard.
  *
  * iOS Safari shrinks the visual viewport when the keyboard opens but keeps
- * the layout viewport, so a composer stuck to the bottom of its scroller ends
- * up behind the keyboard. The plugin measures how much of the composer is
- * actually hidden and lifts it by exactly that amount.
+ * the layout viewport, so a shell sized to the layout viewport puts its
+ * composer - sticky at the bottom of the shell's own scroller - behind the
+ * keyboard. The plugin therefore sizes the shell to the visible area, and the
+ * composer lands on the top edge of the keyboard by construction.
+ *
+ * The composer is never measured to find out how much of it is hidden: the
+ * composer is an element of the very shell the plugin resizes, so a
+ * measurement reads the result of the previous resize and feeds that value
+ * back into the next one. The lift then alternates between the true keyboard
+ * height and none at all, and the composer ends up half covered.
  *
  * Run with: `node --test tests/mobile-keyboard.test.js`
  */
@@ -17,22 +24,24 @@ import test from 'node:test'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const clientPath = path.join(here, '..', 'client.js')
+const INSTALL = Symbol.for('dsh.remote-control.install-keyboard-inset')
 
 /**
  * Load the browser half with a fake viewport and document.
  *
- * @param {{innerHeight?: number, viewportHeight?: number, viewportOffsetTop?: number, composerBottom?: number}} options
+ * @param {{layoutHeight?: number, viewportHeight?: number, viewportOffsetTop?: number, userAgent?: string, platform?: string, maxTouchPoints?: number, focused?: boolean, withShell?: boolean}} options
  * @returns {Promise<any>} the fake window, document and the recorded calls.
  */
 async function loadClient(options = {}) {
-  const innerHeight = options.innerHeight ?? 800
+  const layoutHeight = options.layoutHeight ?? 800
   const viewportHeight = options.viewportHeight ?? 500
   const viewportOffsetTop = options.viewportOffsetTop ?? 0
-  const composerBottom = options.composerBottom ?? 900
   const properties = []
   const removed = []
+  const attributes = new Map()
   const listeners = new Map()
   const documentListeners = new Map()
+  const windowListeners = new Map()
   const viewport = {
     height: viewportHeight,
     offsetTop: viewportOffsetTop,
@@ -43,21 +52,34 @@ async function loadClient(options = {}) {
       listeners.delete(type)
     },
   }
-  const target = { name: 'the-focused-field' }
+  // The seat must never be measured: a measurement of a transformed element
+  // reads the lift it already carries and feeds it back into the next one.
   const seat = {
-    getBoundingClientRect: () => ({ bottom: composerBottom, top: composerBottom - 60 }),
-    contains: (node) => node === target,
+    style: {
+      setProperty: (name, value) => properties.push([`seat:${name}`, value]),
+      removeProperty: (name) => removed.push(`seat:${name}`),
+    },
+    getBoundingClientRect: () => {
+      throw new Error('the composer must not be measured')
+    },
+    contains: () => true,
   }
+  const shell = options.withShell === false ? null : { id: 'root' }
+  const field = { tagName: 'TEXTAREA' }
   const document = {
     documentElement: {
+      clientHeight: layoutHeight,
       style: {
         setProperty: (name, value) => properties.push([name, value]),
         removeProperty: (name) => removed.push(name),
       },
+      setAttribute: (name, value) => attributes.set(name, value),
+      removeAttribute: (name) => attributes.delete(name),
     },
+    activeElement: options.focused === false ? null : field,
     querySelector: (selector) => (selector === '[data-composer-seat]' ? seat : null),
+    getElementById: (id) => (id === 'root' ? shell : null),
     head: { appendChild: () => {} },
-    getElementById: () => null,
     createElement: (tagName) => ({ tagName: String(tagName).toUpperCase(), id: '', textContent: '' }),
     querySelectorAll: () => [],
     addEventListener(type, handler) {
@@ -67,121 +89,149 @@ async function loadClient(options = {}) {
       documentListeners.delete(type)
     },
   }
+  const frames = []
   const window = {
-    innerHeight,
+    innerHeight: layoutHeight,
     navigator: {
       userAgent: options.userAgent ?? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15',
       platform: options.platform ?? 'MacIntel',
       maxTouchPoints: options.maxTouchPoints ?? 0,
     },
     visualViewport: viewport,
+    // The frame queue is flushed by hand: a fake that runs the callback
+    // straight away leaves the guard set and every later event is dropped.
     requestAnimationFrame: (callback) => {
-      callback()
-      return 1
+      frames.push(callback)
+      return frames.length
     },
     cancelAnimationFrame() {},
+    addEventListener(type, handler) {
+      windowListeners.set(type, handler)
+    },
+    removeEventListener(type) {
+      windowListeners.delete(type)
+    },
     matchMedia: () => ({ matches: true }),
     __ModuleLoader__: { load() {} },
   }
   const source = await readFile(clientPath, 'utf8')
   new Function('window', 'document', `${source}\n//# sourceURL=client.js`)(window, document)
-  const focus = (target) => {
-    const handler = documentListeners.get('focusin')
-    if (handler) handler({ target })
+  const flush = () => {
+    while (frames.length > 0) frames.shift()()
   }
-  return { document, documentListeners, focus, properties, removed, listeners, target, viewport, window }
+  return {
+    attributes, document, documentListeners, flush, properties, removed,
+    listeners, seat, viewport, window, windowListeners,
+  }
 }
 
-test('the composer is lifted by exactly the hidden keyboard height', async () => {
-  const { properties, removed, window } = await loadClient()
-  const install = window[Symbol.for('dsh.remote-control.install-keyboard-inset')]
+test('the shell is sized to the visible area while a keyboard is up', async () => {
+  const { attributes, properties, window } = await loadClient()
+  const install = window[INSTALL]
   assert.equal(typeof install, 'function')
   const dispose = install()
-  // The composer ends 900px down the layout viewport while the visible area
-  // ends at 500px, so 400px of it are behind the keyboard.
-  assert.deepEqual(properties.at(-1), ['--dsh-rc-keyboard-inset', '400px'])
+  // The layout viewport is 800px tall and the keyboard covers everything
+  // below 500px, so the shell follows the 500px that are still visible.
+  assert.deepEqual(properties.at(-2), ['--dsh-vv-height', '500px'])
+  assert.deepEqual(properties.at(-1), ['--dsh-vv-offset', '0px'])
+  assert.equal(attributes.get('data-dsh-keyboard'), 'open')
   dispose()
-  assert.ok(removed.includes('--dsh-rc-keyboard-inset'))
 })
 
-test('a visible composer is not lifted at all', async () => {
-  const { properties, window } = await loadClient({ composerBottom: 400 })
-  const install = window[Symbol.for('dsh.remote-control.install-keyboard-inset')]
-  install()
-  assert.deepEqual(properties.at(-1), ['--dsh-rc-keyboard-inset', '0px'])
+test('the composer is never measured', async () => {
+  // The fake seat throws when it is measured, so the test fails if the
+  // installer reads the composer's box again.
+  const { window } = await loadClient()
+  window[INSTALL]()
 })
 
-test('the keyboard inset follows the visual viewport', async () => {
-  const { listeners, properties, viewport, window } = await loadClient()
-  const install = window[Symbol.for('dsh.remote-control.install-keyboard-inset')]
-  const dispose = install()
+test('a page that merely scrolled keeps the shell as it is', async () => {
+  const { attributes, properties, removed, window } = await loadClient({ focused: false })
+  window[INSTALL]()
+  // Nothing is being typed, so the browser bar is what shrank the visible
+  // area; the shell must not follow it.
+  assert.equal(properties.length, 0)
+  assert.equal(removed.includes('--dsh-vv-height'), true)
+  assert.equal(attributes.has('data-dsh-keyboard'), false)
+})
+
+test('the shell follows the visual viewport', async () => {
+  const { flush, listeners, properties, viewport, window } = await loadClient()
+  const dispose = window[INSTALL]()
   assert.equal(typeof listeners.get('resize'), 'function')
   assert.equal(typeof listeners.get('scroll'), 'function')
-  viewport.height = 700
+  viewport.height = 650
   listeners.get('resize')()
-  assert.deepEqual(properties.at(-1), ['--dsh-rc-keyboard-inset', '200px'])
+  flush()
+  assert.deepEqual(properties.at(-2), ['--dsh-vv-height', '650px'])
   dispose()
   assert.equal(listeners.size, 0)
 })
 
-test('the composer seat is moved up by the measured inset', async () => {
-  const styles = []
-  const document = {
-    head: {
-      appendChild(node) {
-        if (node.tagName === 'STYLE') styles.push(node)
-        return node
-      },
-    },
-    getElementById: () => null,
-    createElement: (tagName) => ({ tagName: String(tagName).toUpperCase(), id: '', textContent: '' }),
-    querySelectorAll: () => [],
-  }
-  const window = { __ModuleLoader__: { load() {} } }
-  const source = await readFile(clientPath, 'utf8')
-  new Function('window', 'document', `${source}\n//# sourceURL=client.js`)(window, document)
-  const style = styles.find((entry) => entry.id === 'dsh-remote-control-mobile-layout')
-  assert.ok(style)
-  assert.match(style.textContent, /\[data-composer-seat\][^{]*\{[^}]*translateY\(calc\(-1 \* var\(--dsh-rc-keyboard-inset, 0px\)\)\) !important/s)
+test('a browser bar that hides a little is not a keyboard', async () => {
+  const { flush, listeners, removed, viewport, window } = await loadClient()
+  const dispose = window[INSTALL]()
+  // A hundred pixels is a browser bar, not a keyboard: the shell must stay.
+  viewport.height = 700
+  listeners.get('resize')()
+  flush()
+  assert.equal(removed.includes('--dsh-vv-height'), true)
+  dispose()
 })
 
-test('an iPhone also clears the input method toolbar above the keyboard', async () => {
+test('the shell follows the pan of the visible area', async () => {
+  const { flush, listeners, properties, viewport, window } = await loadClient({ viewportOffsetTop: 40 })
+  window[INSTALL]()
+  viewport.offsetTop = 120
+  listeners.get('scroll')()
+  flush()
+  assert.deepEqual(properties.at(-1), ['--dsh-vv-offset', '120px'])
+})
+
+test('an iPhone keeps the whole visible area for the composer', async () => {
   const { properties, window } = await loadClient({
     userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148',
     platform: 'iPhone',
     maxTouchPoints: 5,
   })
-  const install = window[Symbol.for('dsh.remote-control.install-keyboard-inset')]
-  install()
-  // 400px of keyboard, plus the room the Chinese input method's own toolbar
-  // takes above it — that toolbar is drawn over the page and never shows up in
-  // the visual viewport.
-  const value = Number(String(properties.at(-1)[1]).replace('px', ''))
-  assert.ok(value > 400, `expected room for the input method toolbar, got ${value}px`)
+  window[INSTALL]()
+  // The Chinese candidate bar belongs to the keyboard, so the visible area
+  // already ends where the keyboard begins. A reserve on top of that would
+  // leave an empty band under the composer.
+  assert.deepEqual(properties.at(-2), ['--dsh-vv-height', '500px'])
 })
 
-test('another platform keeps the plain keyboard height', async () => {
+test('another platform keeps the whole visible area', async () => {
   const { properties, window } = await loadClient()
-  const install = window[Symbol.for('dsh.remote-control.install-keyboard-inset')]
-  install()
-  assert.deepEqual(properties.at(-1), ['--dsh-rc-keyboard-inset', '400px'])
+  window[INSTALL]()
+  assert.deepEqual(properties.at(-2), ['--dsh-vv-height', '500px'])
 })
 
-test('the composer clears the input method toolbar while it has the focus', async () => {
-  const { focus, properties, target, window } = await loadClient({
-    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148',
-    platform: 'iPhone',
-    maxTouchPoints: 5,
-    // Safari scrolls the page to reveal the field, so nothing of the composer
-    // is below the visible area any more - and the measurement alone would
-    // report "nothing is covered".
-    viewportHeight: 900,
-    innerHeight: 900,
-    composerBottom: 800,
-  })
-  const install = window[Symbol.for('dsh.remote-control.install-keyboard-inset')]
-  install()
-  focus(target)
-  const value = Number(String(properties.at(-1)[1]).replace('px', ''))
-  assert.ok(value > 0, `expected room for the input method toolbar, got ${value}px`)
+test('the shell returns to its normal height when the keyboard closes', async () => {
+  const { flush, listeners, removed, viewport, window } = await loadClient()
+  const dispose = window[INSTALL]()
+  viewport.height = 800
+  listeners.get('resize')()
+  flush()
+  assert.equal(removed.includes('--dsh-vv-height'), true)
+  dispose()
+})
+
+test('the disposer takes the listeners and the variables away', async () => {
+  const { documentListeners, listeners, removed, window, windowListeners } = await loadClient()
+  const dispose = window[INSTALL]()
+  dispose()
+  assert.equal(listeners.size, 0)
+  assert.equal(windowListeners.size, 0)
+  assert.equal(documentListeners.size, 0)
+  assert.equal(removed.includes('--dsh-vv-height'), true)
+  assert.equal(removed.includes('--dsh-vv-offset'), true)
+})
+
+test('without a shell the composer is raised by a margin', async () => {
+  const { properties, window } = await loadClient({ withShell: false })
+  window[INSTALL]()
+  // A margin moves the box without changing what the box measures, so the
+  // measurement cannot feed back into itself the way a transform does.
+  assert.deepEqual(properties.at(-1), ['seat:margin-bottom', '300px'])
 })

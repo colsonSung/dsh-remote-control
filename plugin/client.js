@@ -777,12 +777,16 @@ function installMobileSidebarLayout() {
     '',
     '  /* A menu surface that does not depend on CSS anchor positioning. The',
     '     host paints it with an anchored element, which iOS Safari does not',
-    '     implement yet: the menu would show the page straight through it. */',
+    '     implement yet: the menu would show the page straight through it.',
+    '     The height is left to the host: it measures the room the menu has',
+    '     above its anchor and writes that room down as an inline max-height.',
+    '     A fixed share of the screen ignores that measurement, and the menu',
+    '     then reaches over the top of the display - the first entries, the',
+    '     file picker among them, are out of reach. */',
     '  [data-menu-material] {',
     '    background: var(--dsw-alias-bg-layer-2) !important;',
     '    box-shadow: var(--dsw-elevation-prominent) !important;',
     '    max-width: calc(100vw - 24px) !important;',
-    '    max-height: 70dvh !important;',
     '    overflow-y: auto !important;',
     '  }',
     '',
@@ -838,12 +842,34 @@ function installMobileSidebarLayout() {
     '  [data-composer-seat] {',
     '    padding-bottom: calc(4px + env(safe-area-inset-bottom, 0px)) !important;',
     '    background: var(--dsw-alias-bg-base) !important;',
-    '    transform: translateY(calc(-1 * var(--dsh-rc-keyboard-inset, 0px))) !important;',
-    '    will-change: transform;',
+    '  }',
+    '',
+    '  /* The shell follows the visible area of the phone.',
+    '     The composer is sticky at the bottom of the shell\'s own scroller, so a',
+    '     shell sized to the visible area puts the composer on the top edge of',
+    '     the keyboard by construction - no measuring, no lifting, no overlay.',
+    '     The document itself must not scroll either: Safari scrolls the page to',
+    '     reveal a focused field, and a scrolled page moves the shell away from',
+    '     the visible area the variables describe. */',
+    '  html, body {',
+    '    overflow: hidden !important;',
+    '    overscroll-behavior: none !important;',
+    '  }',
+    '  #root {',
+    '    height: var(--dsh-vv-height, 100%) !important;',
+    '    margin-top: var(--dsh-vv-offset, 0px) !important;',
     '  }',
     '  [data-composer-card] {',
     '    border-radius: var(--dsw-radius-panel) !important;',
     '    gap: 4px !important;',
+    '  }',
+    '',
+    '  /* A dropdown that belongs to the composer - the file picker, the',
+    '     command list - is painted above the composer. The text field would',
+    '     then take the room the dropdown needs, so the field steps aside while',
+    '     the dropdown is open and the buttons stay where they are. */',
+    '  [data-composer-seat]:has([data-trigger-menu]) [data-input-scroll] {',
+    '    display: none !important;',
     '  }',
     '  [data-input-scroll] {',
     '    max-height: min(32dvh, 180px) !important;',
@@ -981,12 +1007,91 @@ function installMobileSidebarLayout() {
     '    touch-action: manipulation !important;',
     '  }',
     '}',
+    '',
+    '/* A remote page is served to a device that is not the machine the agent',
+    '   runs on: the browser half marks it (`html[data-dsh-remote]`) when the',
+    '   origin is not a loopback address, so a phone or a tablet through the',
+    '   tunnel is told apart from the desktop app itself.',
+    '   Three controls of the conversation header act on that computer, and on',
+    '   a remote device they can only fail: the editor hand-off opens VS Code or',
+    '   Finder on the desktop, the Moments float is a window of the desktop app,',
+    '   and the live recorder captures the desktop microphone. They are hidden at',
+    '   every width - a remote device can be as wide as a tablet while still',
+    '   holding no microphone, no window and no editor.',
+    '   `[data-open-target]` is the host\'s own marker for the split button that',
+    '   hands a file or a folder to an application; the two plugins mark their',
+    '   quick buttons with classes of their own. */',
+    'html[data-dsh-remote] :is(',
+    '  [data-open-target],',
+    '  .mm-quick,',
+    '  .mvm-quick,',
+    '  .mm-quick-button,',
+    '  .mvm-quick-button,',
+    '  [aria-label="Open the Moments float"],',
+    '  [aria-label="Start live"]',
+    ') {',
+    '  display: none !important;',
+    '}',
+    '/* The split button is wrapped by an anchor that keeps its two halves',
+    '   together: hiding only the halves leaves a gap the width of the button. */',
+    'html[data-dsh-remote] :has(> [data-open-target]) {',
+    '  display: none !important;',
+    '}',
   ].join('\n')
   document.head.appendChild(style)
 }
 
+/**
+ * Whether this page is served to a device that is not the machine the agent
+ * runs on.
+ *
+ * The desktop app and a local browser reach the server on a loopback address;
+ * the relay hands the same page to a phone or a tablet through its own domain.
+ * The host name is therefore the one signal that tells the two apart without
+ * the cooperation of the host, and it is what this rule reads.
+ *
+ * @returns {boolean} true when the page is a remote one
+ */
+function isRemotePage() {
+  if (typeof window === 'undefined') return false
+  const location = window.location
+  // A remote page arrives over HTTP(S) through the relay. The desktop app can
+  // also load its own document from an application scheme (`dsh-app:`), and a
+  // scheme is never a remote device.
+  const protocol = String(location?.protocol ?? '')
+  if (protocol !== '' && !/^https?:$/.test(protocol)) return false
+  const host = String(location?.hostname ?? '')
+  if (host.length === 0) return false
+  if (host === 'localhost' || host === '[::1]' || host === '::1') return false
+  if (/^127\./.test(host)) return false
+  return true
+}
+
+/**
+ * Mark a remote page so the layout can tell its desktop-only chrome apart.
+ *
+ * The marker is an attribute on the document element, set before the shell
+ * renders: the stylesheet reads it as `html[data-dsh-remote]`, which no build
+ * of the shell owns, so the rule survives an update and does nothing on the
+ * desktop.
+ *
+ * @returns {void}
+ */
+function installRemoteChrome() {
+  if (typeof document === 'undefined') return
+  if (!isRemotePage()) return
+  const root = document.documentElement
+  if (root === null || root === undefined) return
+  root.setAttribute?.('data-dsh-remote', 'true')
+}
+
+/** Where the remote marker is published, so a test can drive it. */
+const REMOTE_PAGE_MARKER = Symbol.for('dsh.remote-control.mark-remote-page')
+window[REMOTE_PAGE_MARKER] = installRemoteChrome
+
 // The layout rule is independent of the shim: it only needs the document.
 installMobileSidebarLayout()
+installRemoteChrome()
 
 /** Where the control marker is published, so a test can drive it. */
 const SIDEBAR_CONTROL_MARKER = Symbol.for('dsh.remote-control.mark-sidebar-controls')
@@ -1031,13 +1136,57 @@ function markSidebarControls(collapseLabel, openLabel) {
 window[SIDEBAR_CONTROL_MARKER] = markSidebarControls
 
 /**
- * The room an iOS input method's own toolbar takes above the keyboard.
+ * How much of the layout viewport the visible area must lose to be a keyboard.
  *
- * That toolbar is drawn over the page rather than inside the keyboard, so it
- * never shows up in the visual viewport. Without this room the composer sits
- * exactly where the toolbar is drawn and the lower half of it is covered.
+ * A phone keyboard takes a third of the screen; a browser bar that collapses
+ * takes a few dozen pixels. The threshold tells the two apart, so a page that
+ * merely scrolled is never mistaken for a keyboard.
  */
-const IME_TOOLBAR_CLEARANCE_PX = 44
+const KEYBOARD_OPEN_THRESHOLD_PX = 100
+
+/**
+ * Read the geometry of the visible area against the whole page.
+ *
+ * A phone keyboard shrinks the visual viewport but keeps the layout viewport,
+ * so the difference between the two is the room the keyboard takes. The layout
+ * viewport is read from the document element rather than from
+ * `window.innerHeight`, which is the visible area on some engines.
+ *
+ * @param {any} viewport the visual viewport
+ * @param {any} doc the document
+ * @returns {{layoutHeight: number, visualHeight: number, visualTop: number, visibleBottom: number, covered: number}} the geometry
+ */
+function readViewportMetrics(viewport, doc) {
+  const root = doc?.documentElement ?? null
+  const layoutHeight = Number(root?.clientHeight ?? 0)
+  const visualHeight = Number.isFinite(viewport?.height) ? viewport.height : layoutHeight
+  const visualTop = Number.isFinite(viewport?.offsetTop) ? viewport.offsetTop : 0
+  const visibleBottom = visualTop + visualHeight
+  return {
+    layoutHeight,
+    visualHeight,
+    visualTop,
+    visibleBottom,
+    covered: Math.max(0, layoutHeight - visibleBottom),
+  }
+}
+
+/**
+ * Whether an editable field holds the focus.
+ *
+ * The focus is the signal that a keyboard is up: a browser bar that collapses
+ * also shrinks the visible area, but nobody is typing then.
+ *
+ * @param {any} doc the document
+ * @returns {boolean} true when a field the user can type into is focused
+ */
+function hasEditableFocus(doc) {
+  const active = doc?.activeElement ?? null
+  if (active === null || active === undefined) return false
+  if (active.isContentEditable === true) return true
+  const tag = String(active.tagName ?? '').toUpperCase()
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+}
 
 /** Where the composer control marker is published, so a test can drive it. */
 const COMPOSER_CONTROL_MARKER = Symbol.for('dsh.remote-control.mark-composer-controls')
@@ -1073,88 +1222,118 @@ window[COMPOSER_CONTROL_MARKER] = markComposerControls
 /** Where the keyboard-inset installer is published, so a test can drive it. */
 const KEYBOARD_INSET_MARKER = Symbol.for('dsh.remote-control.install-keyboard-inset')
 
+/** Where the visual-viewport installer is published under its own name. */
+const VISUAL_VIEWPORT_MARKER = Symbol.for('dsh.remote-control.install-visual-viewport-layout')
+
 /**
- * Keep the composer above the phone keyboard.
+ * Keep the app shell inside the visible area of a phone.
  *
- * A phone keyboard shrinks the visual viewport while the layout viewport
- * keeps its height, so a composer pinned to the bottom of its scroller ends
- * up behind the keyboard. The visible bottom of the page is known, and the
- * composer knows where it ends, so the hidden distance is measured instead of
- * guessed; the composer is then lifted by exactly that distance.
+ * A phone keyboard shrinks the visual viewport but keeps the layout viewport,
+ * so a shell sized to the layout viewport puts its composer - sticky at the
+ * bottom of the shell's own scroller - behind the keyboard. The shell is
+ * therefore sized to the visible area instead, and the composer lands on the
+ * keyboard's top edge by construction.
  *
- * @returns {() => void} the disposer removing the listeners and the variable.
+ * The composer is never measured to find out how much of it is hidden: it is
+ * an element of the very shell this code resizes, so a measurement reads the
+ * result of the previous resize and feeds that value back into the next one.
+ * The lift then alternates between the true keyboard height and none at all,
+ * and the composer ends up half covered.
+ *
+ * @returns {() => void} the disposer removing the listeners and the variables.
  */
-function installKeyboardInset() {
+function installVisualViewportLayout() {
   if (typeof document === 'undefined') return () => {}
   const root = document.documentElement
   const viewport = window.visualViewport
   if (root === null || root === undefined || viewport === undefined) return () => {}
-  const agent = window.navigator ?? {}
-  // The Chinese input method on iOS draws its own toolbar above the keyboard.
-  // It is drawn over the page and never changes the visual viewport, so the
-  // composer needs that room as well or the toolbar covers its lower half.
-  const ios = /iPad|iPhone|iPod/.test(String(agent.userAgent ?? ''))
-    || (String(agent.platform ?? '') === 'MacIntel' && Number(agent.maxTouchPoints ?? 0) > 1)
-  // Whether the composer holds the focus is the reliable signal that the
-  // keyboard is up. The numbers are not: Safari scrolls the page to reveal the
-  // field, and then nothing of the composer sits below the visible area any
-  // more, while the keyboard and its toolbar still cover the screen.
-  let focused = false
   let frame = 0
-  const measure = () => {
-    frame = 0
-    const visibleBottom = viewport.offsetTop + viewport.height
+  /**
+   * Raise the composer when there is no shell to resize.
+   *
+   * A margin is used rather than a transform: the margin moves the box
+   * without changing what the box measures, so the measurement cannot feed
+   * back into itself the way a transform does.
+   *
+   * @param {number|null} height the height of the visible area, or null to undo
+   * @returns {void}
+   */
+  const liftComposer = (height) => {
     const seat = document.querySelector('[data-composer-seat]')
-    const rect = seat?.getBoundingClientRect?.()
-    // The measured composer wins: it knows what the keyboard actually covers.
-    // Without a composer the layout distance is the only available estimate.
-    const hidden = rect === undefined
-      ? Math.max(0, Math.round(window.innerHeight - visibleBottom))
-      : Math.max(0, Math.round(rect.bottom - visibleBottom))
-    const keyboardOpen = window.innerHeight - viewport.height > 1
-    const toolbar = ios && (focused || keyboardOpen) ? IME_TOOLBAR_CLEARANCE_PX : 0
-    root.style.setProperty('--dsh-rc-keyboard-inset', `${hidden + toolbar}px`)
-  }
-  const onFocusIn = (event) => {
-    const seat = document.querySelector('[data-composer-seat]')
-    const target = event?.target
-    let inside = false
-    try {
-      inside = Boolean(seat && target && seat.contains(target))
-    } catch {
-      inside = false
+    const style = seat?.style
+    if (style === null || style === undefined) return
+    if (height === null) {
+      style.removeProperty?.('margin-bottom')
+      return
     }
-    focused = inside
-    schedule()
+    const shell = document.getElementById?.('root') ?? null
+    if (shell !== null) return
+    const covered = Math.max(0, Math.round(readViewportMetrics(viewport, document).covered))
+    style.setProperty('margin-bottom', `${covered}px`)
   }
-  const onFocusOut = () => {
-    focused = false
-    schedule()
+  const apply = () => {
+    frame = 0
+    const metrics = readViewportMetrics(viewport, document)
+    // Only a phone has a keyboard over the page; the desktop shell keeps the
+    // height the window gives it.
+    const narrow = window.matchMedia?.('(max-width: 1023px)')?.matches !== false
+    // The keyboard is only up while the user types. A collapsed browser bar
+    // shrinks the visible area as well, and resizing the shell for that would
+    // leave a gap under the composer.
+    const keyboardOpen = narrow
+      && metrics.covered > KEYBOARD_OPEN_THRESHOLD_PX
+      && hasEditableFocus(document)
+    if (!keyboardOpen) {
+      root.style.removeProperty('--dsh-vv-height')
+      root.style.removeProperty('--dsh-vv-offset')
+      root.removeAttribute?.('data-dsh-keyboard')
+      liftComposer(null)
+      return
+    }
+    // The visible area, and nothing less. A reserve for an input method's own
+    // toolbar would leave an empty band under the composer: the Chinese
+    // candidate bar belongs to the keyboard, so the visible area already ends
+    // where the keyboard begins.
+    const height = Math.max(0, Math.round(metrics.visualHeight))
+    root.style.setProperty('--dsh-vv-height', `${height}px`)
+    // Safari pans the visible area instead of the page when it has to reveal
+    // a focused field; the shell follows that pan so it stays in sight.
+    root.style.setProperty('--dsh-vv-offset', `${Math.round(metrics.visualTop)}px`)
+    root.setAttribute?.('data-dsh-keyboard', 'open')
+    liftComposer(height)
   }
   const schedule = () => {
     if (frame !== 0) return
     const request = window.requestAnimationFrame
     if (typeof request !== 'function') {
-      measure()
+      apply()
       return
     }
-    frame = request(measure)
+    frame = request(apply)
   }
   viewport.addEventListener('resize', schedule)
   viewport.addEventListener('scroll', schedule)
-  document.addEventListener('focusin', onFocusIn, true)
-  document.addEventListener('focusout', onFocusOut, true)
-  measure()
+  window.addEventListener?.('resize', schedule)
+  window.addEventListener?.('orientationchange', schedule)
+  document.addEventListener('focusin', schedule, true)
+  document.addEventListener('focusout', schedule, true)
+  apply()
   return () => {
     viewport.removeEventListener('resize', schedule)
     viewport.removeEventListener('scroll', schedule)
-    document.removeEventListener('focusin', onFocusIn, true)
-    document.removeEventListener('focusout', onFocusOut, true)
-    root.style.removeProperty('--dsh-rc-keyboard-inset')
+    window.removeEventListener?.('resize', schedule)
+    window.removeEventListener?.('orientationchange', schedule)
+    document.removeEventListener('focusin', schedule, true)
+    document.removeEventListener('focusout', schedule, true)
+    root.style.removeProperty('--dsh-vv-height')
+    root.style.removeProperty('--dsh-vv-offset')
+    root.removeAttribute?.('data-dsh-keyboard')
+    liftComposer(null)
   }
 }
 
-window[KEYBOARD_INSET_MARKER] = installKeyboardInset
+window[KEYBOARD_INSET_MARKER] = installVisualViewportLayout
+window[VISUAL_VIEWPORT_MARKER] = installVisualViewportLayout
 
 /* ----------------------------------------------------------------- qr code */
 
@@ -1630,6 +1809,29 @@ registerBundle({
     /** The exact Fetch route the Host serves. */
     const ROUTE = '/api/remote-control'
 
+    /**
+     * How long a guest is taken to be typing.
+     *
+     * A copy of `SHARE_TYPING_TTL_MS` from `src/share-room.js`: the browser
+     * half cannot import the module of the Host, so the copy lives here. It is
+     * a number of milliseconds and nothing else changes in it.
+     */
+    const SHARE_TYPING_TTL_MS = 6000
+
+    /**
+     * The letter that stands for one guest.
+     *
+     * A copy of `guestInitial` from `src/share-identity.js`.
+     *
+     * @param {string} name
+     * @returns {string}
+     */
+    function guestInitial(name) {
+      const text = String(name ?? '').trim()
+      if (text.length === 0) return '?'
+      return text.slice(0, 1).toUpperCase()
+    }
+
     const DICTIONARY = {
       en: {
         nav: 'Remote Control',
@@ -1732,6 +1934,14 @@ registerBundle({
         shareDisabled: 'The shared conversation was disabled.',
         shareDeleted: 'The shared conversation was deleted.',
         shareFailed: 'Sharing failed',
+        sharePresenceIdleOne: '1 guest here',
+        sharePresenceIdleMany: '{count} guests here',
+        sharePresenceTypingOne: '{name} is typing…',
+        sharePresenceTypingMany: '{count} people are typing…',
+        sharePresencePanelTitle: 'In this conversation',
+        sharePresenceIsTyping: 'is typing',
+        sharePresenceViewing: 'viewing',
+        sharePresenceEditing: 'editing',
         restartRequired: 'The host plugin is not active yet — restart the Harness to load it.',
       },
       zh: {
@@ -1824,6 +2034,14 @@ registerBundle({
         shareDisabled: '该分享已被禁用。',
         shareDeleted: '该分享已被删除。',
         shareFailed: '分享失败',
+        sharePresenceIdleOne: '1 位访客在线',
+        sharePresenceIdleMany: '{count} 位访客在线',
+        sharePresenceTypingOne: '{name} 正在输入…',
+        sharePresenceTypingMany: '{count} 人正在输入…',
+        sharePresencePanelTitle: '当前会话里',
+        sharePresenceIsTyping: '正在输入',
+        sharePresenceViewing: '在看',
+        sharePresenceEditing: '在编辑',
         relayUrl: '中继服务地址',
         relayUrlHint: '留空则使用内置中继（仅局域网可达）。',
         relayUrlPlaceholder: 'https://relay.example.com',
@@ -1903,6 +2121,39 @@ registerBundle({
 .rc-share-button:hover{background:color-mix(in oklab,var(--dsw-alias-state-business-primary) 8%,transparent);border-color:color-mix(in oklab,var(--dsw-alias-state-business-primary) 18%,transparent);color:var(--dsw-alias-state-business-primary)}
 .rc-share-button:active{transform:scale(.97)}
 .rc-share-icon{display:inline-flex;align-items:center;justify-content:center;flex:none}
+/* The people who are in the shared conversation: the faces of the guests in
+   the corner of the header, and the sign of a guest that is writing. The
+   widget is folded away: the faces stay in the header, and the names wait
+   behind a click. */
+.rc-presence-anchor{position:relative;display:inline-flex}
+.rc-presence{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 8px;border:1px solid transparent;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1;cursor:pointer;transition:background .1s ease,border-color .1s ease,color .1s ease;animation:rc-presence-enter .2s ease-out}
+.rc-presence:hover{background:color-mix(in oklab,var(--dsw-alias-state-business-primary) 8%,transparent);border-color:color-mix(in oklab,var(--dsw-alias-state-business-primary) 18%,transparent);color:var(--dsw-alias-state-business-primary)}
+.rc-presence[aria-expanded="true"]{background:color-mix(in oklab,var(--dsw-alias-state-business-primary) 10%,transparent);border-color:color-mix(in oklab,var(--dsw-alias-state-business-primary) 22%,transparent);color:var(--dsw-alias-state-business-primary)}
+.rc-presence:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}
+.rc-presence-faces{display:inline-flex;align-items:center;gap:3px;flex:none}
+.rc-presence-face{display:grid;place-items:center;width:20px;height:20px;border-radius:999px;color:#fff;font-size:9px;font-weight:600;letter-spacing:.02em;box-shadow:0 0 0 1.5px var(--dsw-alias-bg-base)}
+.rc-presence-face[data-typing="true"]{box-shadow:0 0 0 1.5px var(--dsw-alias-bg-base),0 0 0 3.5px color-mix(in oklab,var(--dsw-alias-state-business-primary) 45%,transparent);animation:rc-presence-pulse 1.5s ease-in-out infinite}
+.rc-presence-more{display:grid;place-items:center;height:20px;padding:0 5px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:9px;font-weight:600}
+.rc-presence-dots{display:inline-flex;align-items:center;gap:3px;flex:none;color:var(--dsw-alias-state-business-primary)}
+.rc-presence-dots i{width:3.5px;height:3.5px;border-radius:999px;background:currentColor;opacity:.3;animation:rc-presence-blink 1.2s ease-in-out infinite}
+.rc-presence-dots i:nth-child(2){animation-delay:.16s}
+.rc-presence-dots i:nth-child(3){animation-delay:.32s}
+/* The panel of the guests: it hangs under the pill of the header and it is
+   fixed, so that no header may cut it off. */
+.rc-presence-panel{position:fixed;z-index:1001;width:264px;padding:10px 12px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-overlay);box-shadow:0 2px 6px color-mix(in oklab,var(--dsw-alias-label-primary) 10%,transparent),0 24px 64px -16px color-mix(in oklab,var(--dsw-alias-label-primary) 32%,transparent);color:var(--dsw-alias-label-primary);animation:rc-presence-enter .16s ease-out}
+.rc-presence-panel-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding-bottom:8px;margin-bottom:8px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.rc-presence-panel-title{font-size:12px;font-weight:600}
+.rc-presence-panel-count{font-size:11px;color:var(--dsw-alias-label-secondary)}
+.rc-presence-panel-body{display:flex;flex-direction:column;gap:6px}
+.rc-presence-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary)}
+.rc-presence-row[data-typing="true"]{color:var(--dsw-alias-label-primary)}
+.rc-presence-row-name{font-weight:500;color:inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rc-presence-typing{color:var(--dsw-alias-label-secondary)}
+.rc-presence-row-file{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);margin-left:auto}
+@keyframes rc-presence-blink{0%,70%,100%{opacity:.3;transform:translateY(0)}35%{opacity:1;transform:translateY(-1px)}}
+@keyframes rc-presence-pulse{0%,100%{box-shadow:0 0 0 1.5px var(--dsw-alias-bg-base),0 0 0 3px color-mix(in oklab,var(--dsw-alias-state-business-primary) 45%,transparent)}50%{box-shadow:0 0 0 1.5px var(--dsw-alias-bg-base),0 0 0 5px color-mix(in oklab,var(--dsw-alias-state-business-primary) 10%,transparent)}}
+@keyframes rc-presence-enter{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){.rc-presence-face[data-typing="true"]{animation:none}.rc-presence-dots i{animation:none;opacity:.7}.rc-presence,.rc-presence-panel{animation:none}}
 .rc-share-button:focus-visible,.rc-share-close:focus-visible,.rc-share-action:focus-visible,.rc-share-copy:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}
 .rc-share-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgb(0 0 0/.46);backdrop-filter:blur(6px);animation:rc-share-fade .18s ease-out}
 .rc-share-modal,.rc-share-row{
@@ -2851,6 +3102,221 @@ registerBundle({
     }
 
     /**
+     * The people who are in the shared conversation.
+     *
+     * The owner of a conversation sees who is in its room and who is writing:
+     * the room of a share is a live stream, and this follows it. The widget
+     * lives in the right corner of the conversation header, next to the
+     * button that shares the conversation in the first place.
+     *
+     * @param {{sessionId?: string, useSessions?: Function, t?: Function}} props
+     */
+    function SharePresenceAction(props) {
+      const t = typeof props.t === 'function' ? props.t : translate
+      const sessionId = sessionIdOf(props)
+      const [room, setRoom] = React.useState({ guests: [], locks: [] })
+      const [, setBeat] = React.useState(0)
+      // The panel of the guests is folded away by default, and it opens under
+      // the pill of the header when the owner asks for it.
+      const [open, setOpen] = React.useState(false)
+      const [place, setPlace] = React.useState({ top: 0, right: 0 })
+      const anchor = React.useRef(null)
+
+      // The room of the conversation, as the Host tells it. The stream is a
+      // long answer that never ends: every change of the room is one frame
+      // of it.
+      React.useEffect(() => {
+        if (sessionId.length === 0) return
+        const controller = new AbortController()
+        let reader = null
+        const apply = (frame) => {
+          const data = frame
+            .split('\n')
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trim())
+            .join('\n')
+          if (data.length === 0) return
+          let payload
+          try {
+            payload = JSON.parse(data)
+          } catch (error) {
+            return
+          }
+          if (payload?.kind !== 'presence') return
+          setRoom({
+            guests: Array.isArray(payload.guests) ? payload.guests : [],
+            locks: Array.isArray(payload.locks) ? payload.locks : [],
+          })
+        }
+        const read = async () => {
+          try {
+            const response = await fetch(`${ROUTE}/presence?sessionId=${encodeURIComponent(sessionId)}`, {
+              method: 'GET',
+              headers: { accept: 'text/event-stream' },
+              signal: controller.signal,
+            })
+            if (!response.ok || response.body === null) return
+            reader = response.body.getReader()
+            const decoder = new TextDecoder()
+            let buffer = ''
+            for (;;) {
+              const chunk = await reader.read()
+              if (chunk.done === true) break
+              buffer += decoder.decode(chunk.value, { stream: true })
+              let cut = buffer.indexOf('\n\n')
+              while (cut !== -1) {
+                const frame = buffer.slice(0, cut)
+                buffer = buffer.slice(cut + 2)
+                apply(frame)
+                cut = buffer.indexOf('\n\n')
+              }
+            }
+          } catch (error) {
+            // The stream ended or the Host is gone: the widget shows nobody.
+          }
+        }
+        void read()
+        return () => {
+          controller.abort()
+          if (reader !== null) {
+            try {
+              void reader.cancel()
+            } catch (error) {
+              // The reader is already closed.
+            }
+          }
+        }
+      }, [sessionId])
+
+      // The words of a guest expire on their own: a guest that closed its tab
+      // never says that it stopped writing. The widget therefore forgets it
+      // when its words run out, without waiting for the Host to say so.
+      const now = Date.now()
+      const typing = room.guests.filter((guest) => guest.typing === true && now - (guest.typingAt ?? 0) < SHARE_TYPING_TTL_MS)
+      React.useEffect(() => {
+        if (typing.length === 0) return
+        const soonest = Math.min(...typing.map((guest) => (guest.typingAt ?? 0) + SHARE_TYPING_TTL_MS))
+        const timer = window.setTimeout(() => setBeat((beat) => beat + 1), Math.max(0, soonest - Date.now()) + 60)
+        return () => window.clearTimeout(timer)
+      }, [room])
+
+      // The widget is folded away by default: the header of a conversation is
+      // the app's own, and a sentence about the guests does not belong in it
+      // while the owner is working. The faces of the guests stay there — they
+      // are small, and they are the sign that somebody is there at all.
+      const toggle = React.useCallback(() => {
+        if (open === true) {
+          setOpen(false)
+          return
+        }
+        // The panel hangs under the pill, and it is fixed: no header may cut
+        // it off.
+        const rect = anchor.current?.getBoundingClientRect?.()
+        if (rect !== undefined) {
+          setPlace({ top: rect.bottom + 8, right: Math.max(12, window.innerWidth - rect.right) })
+        }
+        setOpen(true)
+      }, [open])
+
+      // A click elsewhere, or the escape key, folds the panel away again.
+      React.useEffect(() => {
+        if (open !== true) return
+        const away = (event) => {
+          const node = anchor.current
+          if (node !== null && node !== undefined && node.contains?.(event.target) === true) return
+          setOpen(false)
+        }
+        const key = (event) => {
+          if (event.key === 'Escape') setOpen(false)
+        }
+        document.addEventListener('mousedown', away)
+        window.addEventListener('keydown', key)
+        return () => {
+          document.removeEventListener('mousedown', away)
+          window.removeEventListener('keydown', key)
+        }
+      }, [open])
+
+      // The room is empty: there is nothing to show, and nothing to open.
+      React.useEffect(() => {
+        if (room.guests.length === 0) setOpen(false)
+      }, [room])
+
+      if (room.guests.length === 0) return null
+      const writers = typing.map((guest) => guest.name)
+      const faces = room.guests.slice(0, 3)
+      const more = room.guests.length - faces.length
+      const summary = writers.length === 0
+        ? (room.guests.length === 1
+          ? t('sharePresenceIdleOne')
+          : t('sharePresenceIdleMany', { count: room.guests.length }))
+        : (writers.length === 1
+          ? t('sharePresenceTypingOne', { name: writers[0] })
+          : t('sharePresenceTypingMany', { count: writers.length }))
+      const panel = h('div', {
+        className: 'rc-presence-panel',
+        'data-rc-presence-panel': 'true',
+        style: { top: `${place.top}px`, right: `${place.right}px` },
+        role: 'dialog',
+        'aria-label': t('sharePresencePanelTitle'),
+      },
+      h('div', { className: 'rc-presence-panel-head' },
+        h('span', { className: 'rc-presence-panel-title' }, t('sharePresencePanelTitle')),
+        h('span', { className: 'rc-presence-panel-count' }, summary)),
+      h('div', { className: 'rc-presence-panel-body' },
+        room.guests.map((guest) => h('div', {
+          key: guest.id,
+          className: 'rc-presence-row',
+          'data-rc-presence-row': guest.id,
+          'data-typing': guest.typing === true ? 'true' : 'false',
+        },
+        h('span', {
+          className: 'rc-presence-face',
+          style: { background: guest.color ?? 'var(--dsw-alias-state-business-primary)' },
+        }, guestInitial(guest.name)),
+        h('span', { className: 'rc-presence-row-name' }, guest.name),
+        guest.typing === true
+          ? h('span', { className: 'rc-presence-dots', 'aria-hidden': 'true' }, h('i'), h('i'), h('i'))
+          : null,
+        guest.typing === true
+          ? h('span', { className: 'rc-presence-typing' }, t('sharePresenceIsTyping'))
+          : null,
+        guest.file
+          ? h('span', { className: 'rc-presence-row-file' },
+            (guest.editing === true ? t('sharePresenceEditing') : t('sharePresenceViewing')) + ' ' + guest.file)
+          : null))))
+      return h('div', { className: 'rc-presence-anchor' },
+        h('button', {
+          type: 'button',
+          ref: anchor,
+          className: 'rc-presence',
+          'data-rc-presence': 'true',
+          'data-rc-presence-typing': typing.length > 0 ? 'true' : 'false',
+          'data-rc-presence-open': open === true ? 'true' : 'false',
+          'aria-haspopup': 'true',
+          'aria-expanded': open === true ? 'true' : 'false',
+          'aria-label': summary,
+          title: room.guests.map((guest) => guest.name).join(', '),
+          onClick: toggle,
+        },
+        h('span', { className: 'rc-presence-faces' },
+          faces.map((guest) => h('span', {
+            key: guest.id,
+            className: 'rc-presence-face',
+            'data-rc-presence-guest': guest.id,
+            'data-typing': guest.typing === true ? 'true' : 'false',
+            style: { background: guest.color ?? 'var(--dsw-alias-state-business-primary)' },
+            title: guest.name,
+          }, guestInitial(guest.name))),
+          more > 0 ? h('span', { className: 'rc-presence-more' }, `+${more}`) : null),
+        typing.length > 0
+          ? h('span', { className: 'rc-presence-dots', 'aria-hidden': 'true' },
+            h('i'), h('i'), h('i'))
+          : null),
+        open === true ? ReactDOM.createPortal(panel, document.body) : null)
+    }
+
+    /**
      * One shared conversation in the settings list.
      *
      * @param {{share: any, t: Function, copied: string | null, onCopy: Function, onDisable: Function, onDelete: Function}} props
@@ -3425,7 +3891,7 @@ registerBundle({
           }
           mark()
           const timer = setInterval(mark, 750)
-          const disposeKeyboard = installKeyboardInset()
+          const disposeKeyboard = installVisualViewportLayout()
           return () => {
             clearInterval(timer)
             disposeKeyboard()
@@ -3467,6 +3933,24 @@ registerBundle({
             return () => {}
           }
         }), 'remote-control: session header share')
+        // The people who are in the shared conversation. It sits in the far
+        // right corner of the conversation, past the button that shares it:
+        // the owner of a conversation sees who is in its room, and who is
+        // writing, without opening anything.
+        ctx.effect(() => ctx.slots.inject('conversation.session.header.utilities', () => {
+          try {
+            return ctx.slots.register({
+              name: 'conversation.session.header.utilities',
+              id: 'remote-control-presence',
+              order: 30,
+              locale: NS,
+              label: () => t('sharePresenceIdleOne'),
+            }, SharePresenceAction)
+          } catch (error) {
+            console.warn('[remote-control] the session header presence is already registered', error)
+            return () => {}
+          }
+        }), 'remote-control: session header presence')
         ctx.effect(() => installMobileSidebar(ctx), 'remote-control: phone sidebar')
       },
     }

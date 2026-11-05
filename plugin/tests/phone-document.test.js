@@ -89,3 +89,19 @@ test('a document that is not html is never rewritten', () => {
   const result = rewritePhoneDocument(body, { 'content-type': 'text/javascript' })
   assert.equal(result.body.toString('utf8'), body.toString('utf8'))
 })
+
+test('the phone is not offered the inspector of the machine', () => {
+  // The inspector is a tool of the desktop: it lives on the machine the app
+  // runs on, and its address is a local one. A phone that is somewhere else
+  // cannot reach it, and a browser that tries asks the person for the
+  // permission to reach the local network — again and again, because the
+  // connection is retried for as long as the page lives.
+  const announcement =
+    '<script>globalThis["__DSH_INSPECTOR__"] = {"endpoint":"ws://127.0.0.1:9230/ingest","protocol":"dsh-inspector-v0-abc"}</script>'
+  const body = Buffer.from(`<html><head>${announcement}</head><body></body></html>`, 'utf8')
+  const result = rewritePhoneDocument(body, { ...HTML_HEADERS, 'content-length': String(body.length) })
+  const html = result.body.toString('utf8')
+  assert.doesNotMatch(html, /__DSH_INSPECTOR__/, 'the announcement is gone')
+  assert.doesNotMatch(html, /127\.0\.0\.1:9230/, 'the local address is gone')
+  assert.match(html, /<body>/, 'the rest of the document is untouched')
+})

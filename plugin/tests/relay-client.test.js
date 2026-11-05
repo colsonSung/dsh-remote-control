@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import { test } from 'node:test'
-import { gunzipSync } from 'node:zlib'
+import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants, gunzipSync, gzipSync } from 'node:zlib'
 
 import { WebSocketServer } from 'ws'
 
@@ -405,8 +405,12 @@ test('serves a tunnel request, injects the launch token on the root path', async
   })
 
   // The upstream request was rewritten for the local server.
-  assert.equal(upstream.requests.length, 1)
-  const upstreamRequest = upstream.requests[0]
+  // The Host mints the session for the phone first — a local call — so that
+  // the phone's own request does not have to follow a redirect over the
+  // link. The server handed out no cookie, so the token is still injected.
+  assert.equal(upstream.requests.length, 2)
+  assert.equal(upstream.requests[0].url, '/?token=launch-secret')
+  const upstreamRequest = upstream.requests[1]
   assert.equal(upstreamRequest.method, 'GET')
   assert.equal(upstreamRequest.url, '/?token=launch-secret')
   assert.equal(upstreamRequest.headers.host, `127.0.0.1:${upstream.port}`)
@@ -418,6 +422,106 @@ test('serves a tunnel request, injects the launch token on the root path', async
   // The hop-by-hop headers of the phone are dropped, not forwarded.
   assert.notEqual(upstreamRequest.headers.connection, 'upgrade')
   assert.equal(upstreamRequest.headers['accept-encoding'], 'identity')
+})
+
+test('the phone gets the app in one hop: the Host mints the session for it', async (t) => {
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    if (req.url.includes('token=')) {
+      // The server mints the session and sends the browser to the clean URL.
+      res.writeHead(303, {
+        location: './',
+        'set-cookie': `${sessionCookieName(`127.0.0.1:${upstream.port}`)}=signed-session`,
+      })
+      res.end()
+      return
+    }
+    res.writeHead(200, { 'content-type': 'text/html' })
+    res.end('<html></html>')
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  tunnel.socket.send(
+    encodeFrame(
+      requestFrame({
+        id: 'req-minted',
+        method: 'GET',
+        path: '/',
+        headers: {},
+        body: null,
+      }),
+    ),
+  )
+
+  const response = await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(response.status, 200)
+  // The session was minted locally, and the phone's own request carries it:
+  // there is no redirect for the phone to follow over the link.
+  assert.equal(upstream.requests.length, 2)
+  assert.equal(upstream.requests[1].url, '/', 'the phone asks for the app without a token')
+  assert.match(
+    upstream.requests[1].headers.cookie,
+    new RegExp(`^${sessionCookieName(`127.0.0.1:${upstream.port}`)}=`),
+    'the phone carries the session the Host minted',
+  )
+  // The cookie has to reach the phone as well: a phone whose jar does not
+  // hold the session is a phone whose every later request is refused.
+  const cookies = response.headers['set-cookie']
+  assert.ok(Array.isArray(cookies) && cookies.length === 1, 'the phone is given the session')
+  assert.match(cookies[0], new RegExp(`^${sessionCookieName(`127.0.0.1:${upstream.port}`)}=`))
+  assert.match(cookies[0], /Path=\//)
+  assert.match(cookies[0], /HttpOnly/)
+})
+
+test('the session is minted once, not on every request of the phone', async (t) => {
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    if (req.url.includes('token=')) {
+      res.writeHead(303, {
+        location: './',
+        'set-cookie': `${sessionCookieName(`127.0.0.1:${upstream.port}`)}=signed-session`,
+      })
+      res.end()
+      return
+    }
+    res.writeHead(200, { 'content-type': 'text/html' })
+    res.end('<html></html>')
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  for (const id of ['req-one', 'req-two']) {
+    tunnel.socket.send(
+      encodeFrame(requestFrame({ id, method: 'GET', path: '/', headers: {}, body: null })),
+    )
+    await tunnel.next((frame) => frame.type === 'response' && frame.id === id)
+  }
+
+  // One minting, two requests of the phone.
+  const mintings = upstream.requests.filter((request) => request.url.includes('token='))
+  assert.equal(mintings.length, 1, 'the session is minted once')
+  assert.equal(upstream.requests.length, 3)
 })
 
 test('never injects the launch token on a non-root path', async (t) => {
@@ -452,8 +556,12 @@ test('never injects the launch token on a non-root path', async (t) => {
   assert.equal(response.id, 'req-api')
   assert.equal(response.status, 200)
 
-  assert.equal(upstream.requests.length, 1)
-  const upstreamRequest = upstream.requests[0]
+  // The host attaches the session it holds, so the phone's own request is
+  // authenticated even when its browser kept no cookie. The minting is the
+  // first request; the phone's own request follows it.
+  assert.equal(upstream.requests.length, 2)
+  assert.equal(upstream.requests[0].url, '/?token=launch-secret')
+  const upstreamRequest = upstream.requests[1]
   assert.equal(upstreamRequest.url, '/api/rpc?x=1')
   assert.equal(upstreamRequest.headers.origin, `http://127.0.0.1:${upstream.port}`)
   assert.equal(upstreamRequest.headers['content-type'], 'application/json')
@@ -489,8 +597,9 @@ test('treats /<deviceId>/ as the device root and forwards it as /', async (t) =>
   )
 
   await tunnel.next((frame) => frame.type === 'response')
-  assert.equal(upstream.requests.length, 1)
-  assert.equal(upstream.requests[0].url, '/?token=launch-secret')
+  // The minting comes first, and the phone's own request follows it.
+  assert.equal(upstream.requests.length, 2)
+  assert.equal(upstream.requests[1].url, '/?token=launch-secret')
 })
 
 test('does not inject the launch token once the phone has a session cookie', async (t) => {
@@ -565,10 +674,10 @@ test('trades the launch token in again when the session cookie belongs to anothe
   )
 
   await tunnel.next((frame) => frame.type === 'response')
-  assert.equal(upstream.requests.length, 1)
-  assert.equal(upstream.requests[0].url, '/?token=launch-secret')
+  assert.equal(upstream.requests.length, 2)
+  assert.equal(upstream.requests[1].url, '/?token=launch-secret')
   // The phone's own cookies are passed through untouched.
-  assert.equal(upstream.requests[0].headers.cookie, `dsh-rc=relay-session; ${stale}`)
+  assert.equal(upstream.requests[1].headers.cookie, `dsh-rc=relay-session; ${stale}`)
 })
 
 test('retries with the launch token when the server refuses the session cookie', async (t) => {
@@ -653,8 +762,9 @@ test('does not retry a refused request outside the device root', async (t) => {
   )
 
   const response = await tunnel.next((frame) => frame.type === 'response')
-  assert.equal(upstream.requests.length, 1)
-  assert.equal(upstream.requests[0].url, '/api/remote.mux')
+  // The minting comes first, and the refused request follows it.
+  assert.equal(upstream.requests.length, 2)
+  assert.equal(upstream.requests[1].url, '/api/remote.mux')
   assert.equal(response.status, 401)
 })
 
@@ -691,9 +801,9 @@ test('gives up after one retry when the server refuses the launch token too', as
 
   const response = await tunnel.next((frame) => frame.type === 'response')
   // The phone holds no cookie, so the first attempt already carried the
-  // launch token; the host must not loop.
-  assert.equal(upstream.requests.length, 1)
-  assert.equal(upstream.requests[0].url, '/?token=launch-secret')
+  // launch token; the host must not loop. The minting comes before it.
+  assert.equal(upstream.requests.length, 2)
+  assert.equal(upstream.requests[1].url, '/?token=launch-secret')
   assert.equal(response.status, 401)
 })
 
@@ -726,8 +836,10 @@ test('injects the launch token when the cookie is not a session cookie', async (
   )
 
   await tunnel.next((frame) => frame.type === 'response')
-  assert.equal(upstream.requests.length, 1)
-  assert.equal(upstream.requests[0].url, '/?token=launch-secret')
+  // The minting of the session comes first; the phone's own request carries
+  // the token, because the server handed out no cookie.
+  assert.equal(upstream.requests.length, 2)
+  assert.equal(upstream.requests[1].url, '/?token=launch-secret')
 })
 
 test('keeps an existing token query parameter untouched', async (t) => {
@@ -799,13 +911,66 @@ test('compresses a large text response before it enters the tunnel', async (t) =
   assert.equal(response.status, 200)
   // The phone's browser decompresses on its own; the relay forwards the
   // encoding untouched.
-  assert.equal(response.headers['content-encoding'], 'gzip')
+  assert.equal(response.headers['content-encoding'], 'br')
   const raw = Buffer.from(response.body, 'base64')
   assert.equal(Number(response.headers['content-length']), raw.length)
   // The tunnel carries the body base64-encoded, so the compression is what
   // makes a remote relay bearable.
   assert.ok(raw.length < payload.length / 2, `expected a smaller body, got ${raw.length}`)
-  assert.equal(gunzipSync(raw).toString('utf8'), payload)
+  assert.equal(brotliDecompressSync(raw).toString('utf8'), payload)
+})
+
+test('the bundle of every plugin travels smaller under brotli than under gzip', async (t) => {
+  // The body that hurts most is the one that carries the client bundles of
+  // every installed plugin: megabytes of minified JavaScript. Gzip has a
+  // window of 32 KB and cannot see across the bundles; brotli can see the
+  // whole body at once.
+  let seed = 42
+  const next = () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed
+  }
+  const names = Array.from({ length: 256 }, (_, index) => `symbol${index}${(next() % 97).toString(36)}`)
+  const payload = Array.from({ length: 20000 }, () => names[next() % names.length]).join(';')
+
+  const relay = new FakeRelay()
+  const upstream = new FakeUpstream((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/javascript' })
+    res.end(payload)
+  })
+  await relay.listen()
+  await upstream.listen()
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const client = makeClient({ relayUrl: relay.url, localBaseUrl: upstream.url })
+  t.after(() => client.stop())
+
+  await client.start()
+  const tunnel = await relay.waitFor('tunnel')
+
+  tunnel.socket.send(
+    encodeFrame(requestFrame({ id: 'req-brotli', method: 'GET', path: '/app.js', headers: {}, body: null })),
+  )
+
+  const response = await tunnel.next((frame) => frame.type === 'response')
+  assert.equal(response.headers['content-encoding'], 'br')
+  const raw = Buffer.from(response.body, 'base64')
+  const underGzip = gzipSync(Buffer.from(payload), { level: 6 }).length
+  assert.ok(
+    raw.length < underGzip,
+    `expected brotli to beat gzip (${raw.length} vs ${underGzip})`,
+  )
+  assert.equal(brotliDecompressSync(raw).toString('utf8'), payload)
+  // The body is what the phone receives, so it must be smaller than the
+  // bundle itself.
+  assert.ok(raw.length < Buffer.byteLength(payload) / 4, `expected a smaller body, got ${raw.length}`)
+  // The tunnel must not make the body bigger than brotli would.
+  assert.ok(raw.length <= brotliCompressSync(Buffer.from(payload), {
+    params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 6 },
+  }).length + 1024)
 })
 
 test('leaves a small response and an already encoded one alone', async (t) => {  const relay = new FakeRelay()
@@ -888,7 +1053,7 @@ test('sends the body as a binary message when the relay accepts one', async (t) 
   const decoded = decodeBinaryBody(await tunnel.nextBinary())
   assert.ok(decoded !== undefined)
   assert.equal(decoded.id, 'req-binary')
-  assert.equal(gunzipSync(decoded.body).toString('utf8'), payload)
+  assert.equal(brotliDecompressSync(decoded.body).toString('utf8'), payload)
 })
 
 test('keeps the JSON frame when the relay does not accept a binary body', async (t) => {
@@ -926,7 +1091,7 @@ test('keeps the JSON frame when the relay does not accept a binary body', async 
   const response = await tunnel.next((frame) => frame.type === 'response')
   assert.equal(response.body_encoding, 'base64')
   assert.equal(tunnel.binaries.length, 0)
-  assert.equal(gunzipSync(Buffer.from(response.body, 'base64')).toString('utf8'), payload)
+  assert.equal(brotliDecompressSync(Buffer.from(response.body, 'base64')).toString('utf8'), payload)
 })
 
 test('aborts the in-flight upstream request on an abort frame', async (t) => {

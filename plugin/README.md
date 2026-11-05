@@ -358,16 +358,27 @@ have no way left to hand the phone a valid session.
 
 ### The first load is heavy
 
-The web app is one JavaScript bundle of roughly 9 MB, and it travels through
-the tunnel to the relay before the relay can pass it on to the phone. Two
-things keep that affordable:
+The web app is not one bundle any more: it is the app's own code **and** the
+client bundle of every installed plugin. Measured on a phone-sized viewport
+through the public relay, the first load was **6.3 MB in 104 requests** — and
+5 MB of it was the plugin bundles, which compress badly because they are
+several megabytes of *minified* JavaScript, concatenated.
 
-* the host **compresses** every response before it enters the tunnel — the
-  bundle shrinks from 9 MB to 3.7 MB — and the phone's browser decompresses it
-  on its own;
+Three things keep that affordable:
+
+* the host **compresses** every response before it enters the tunnel, and the
+  phone's browser decompresses it on its own;
+* the compression is **brotli**, not gzip. Gzip has a window of 32 KB and
+  cannot see across the bundles; brotli can see the whole body at once, and
+  the big bundle shrinks by 9% more under it (2.3× under gzip, 3.1× under
+  brotli) — and brotli compresses *faster* at that quality, which matters
+  because the host compresses on the request path and the phone waits;
 * a relay that advertises the `binary_body` capability also accepts a body as
   one **binary WebSocket message**, so the body does not pay for the base64
   inflation a JSON frame would cost it.
+
+Every browser that can run the Harness app understands `content-encoding: br`,
+so nothing in the browser half has to know about it.
 
 That leaves the link itself as the bottleneck: on a 4 Mbit/s uplink the first
 load still takes about ten seconds. The browser caches the bundle by its
@@ -376,6 +387,80 @@ does not have this cost at all.
 
 An older relay that does not advertise the capability keeps working: the host
 falls back to the base64 body inside the JSON frame.
+
+### The phone gets the app in one hop
+
+The server answers the app root with a cookie and a redirect to the clean URL.
+Through a relay that redirect costs a whole extra round trip over the link —
+and a browser that does not keep the cookie pays it again on every request,
+which is a loop the phone never leaves.
+
+The host therefore mints the session itself: one local call, and the phone's
+request carries the cookie from then on. The redirect never reaches the phone.
+
+The cookie has to reach the phone as well, and it does — the host hands it
+over with the answer. A phone whose jar does not hold the session is a phone
+whose every later request is refused, and an app that comes up empty.
+
+And the session the host holds is attached to **every** request of the phone
+that does not carry a valid one. A browser that keeps no cookie — a private
+window, a browser that blocks it, a page opened before the session existed —
+is still answered. The guest never gets it: the launch token and the session
+are the owner's credential.
+
+### The stream of the phone is kept alive
+
+The relay cuts a stream that says nothing for five minutes, and a phone that
+only reads the conversation says nothing for a long time. The cut costs the
+phone its session, and with it the messages that arrived while it was gone.
+
+The host therefore keeps the event stream alive with a comment — the shape
+Server-Sent Events defines for exactly this — every minute. The phone's
+browser ignores the comment; the relay does not cut the stream.
+
+### The app's own data gets a longer window
+
+A file is answered in a moment: the host reads it and sends it. The app's own
+data is work — the session list of a busy machine is megabytes of JSON — and
+the host needs the time to build it. A phone that asks for it must not be
+told "no answer in time" while the host is still working.
+
+The relay therefore gives the paths under `/api` and `/share` a window of two
+minutes, and keeps the ordinary window of thirty seconds for everything else.
+
+### The phone is not offered the inspector of the machine
+
+The inspector is a tool of the desktop: it lives on the machine the app runs
+on, and its address is a local one. A phone that is somewhere else cannot
+reach it, and a browser that tries asks the person for the permission to
+reach the local network — again and again, because the connection is retried
+for as long as the page lives.
+
+The tunnel therefore takes the announcement out of the phone's copy of the
+document. The inspector's client half reads it when it is there and does
+nothing when it is not.
+
+### The controls that act on the computer are gone on a remote page
+
+A page served through the tunnel runs on a device that is not the machine the
+agent runs on. Three controls of the conversation header act on that machine,
+so from the phone they can only fail:
+
+| Control | What it acts on |
+| --- | --- |
+| the editor hand-off (VS Code, Finder, Xcode, a terminal) | opens an application on the desktop |
+| the Moments quick button | opens a window of the desktop app |
+| the live recorder (Minutes) | captures the desktop microphone |
+
+The browser half therefore marks the document with `data-dsh-remote` whenever
+the origin is not a loopback address, and the phone layout hides those controls
+at every width: a remote device can be as wide as a tablet and still hold no
+microphone, no window and no editor. The desktop app (a loopback origin) keeps
+all three.
+
+The three were also what pushed the phone header past the screen: on a 440px
+phone it measured 544px wide, so the controls at its tail scrolled out of
+reach while three dead ones stayed visible.
 
 ### Two relay modes
 
@@ -445,7 +530,9 @@ Settings navigation next to *General*, *Models*, *Plugins* and *Agent presets*.
 | `src/relay-client.js` | The host side of the tunnel |
 | `src/device-store.js` | Durable device identity and the shared secret |
 | `src/share-store.js` | Durable share records: the session, the permission, the passcode and the project root |
-| `src/share-service.js` | The guest surface: the routes, the passcode, the cookie, the project boundary |
+| `src/share-service.js` | The guest surface: the routes, the passcode, the cookie, the project boundary, the room of the owner |
+| `src/share-room.js` | The room of a share: the guests, the locks, and who is writing |
+| `src/share-identity.js` | The name and the colour of a guest — the same in every place it is shown |
 | `tools/sync-contract.js` | Writes the wire contract into the browser half and checks it |
 | `tests/` | The test suites: relay unit suites, the tunnel end to end, the compression path |
 | `../remote-control-relay/` | The standalone relay for cloud deployments |
@@ -477,6 +564,24 @@ caller with the same browser session the rest of the app uses, so no extra
 credential is needed. (The generic `rpc.handle` channel registry only supports
 the shared `/api` channel, so a feature-specific route is the supported way to
 add a host endpoint.)
+
+## The log of the plugin
+
+Everything the plugin says goes to the console of the Host (`ctx.logger`), and
+to a file of its own: **`<profile>/plugins/remote-control.log`**.
+
+The file is there because the console is not enough. The desktop app keeps
+what its console says in memory and writes it into a crash report when it
+stops — so a phone that fails at night, when nobody is looking, leaves
+nothing behind. The file of the plugin is written as the words are said, and
+it is kept for the owner alone (`0600`).
+
+It is rotated when it grows past a megabyte: the live log becomes `.1`, the
+one before it becomes `.2`, and the one before that is let go.
+
+```
+tail -f ~/.dsh/profiles/desktop/plugins/remote-control.log
+```
 
 ---
 
@@ -549,7 +654,7 @@ never reaches them.
 | `GET /share/<id>/api/blob?path=` | Reads one image of the project as bytes |
 | `GET /share/<id>/api/asset?name=mermaid` | The mermaid library, for the documents that carry a diagram |
 | `GET /share/<id>/api/room` | Who is in the room, and what each of them holds |
-| `POST /share/<id>/api/room` | A guest says who it is, what it has open, whether it holds it |
+| `POST /share/<id>/api/room` | A guest says who it is, what it has open, whether it holds it, whether it is writing |
 | `POST /share/<id>/api/edit` | A guest puts its text into a file — refused when the file moved on |
 | `POST /share/<id>/api/collab` | The collaborative document of a file: open it, change it, move the cursors |
 
@@ -607,6 +712,35 @@ library is five megabytes and it comes in the background while the guest
 reads. The diagram wears the palette of the page — the accent of the page
 is the border of the nodes — so it reads as part of the document rather
 than as a picture of another one.
+
+The document follows the width of the panel it is shown in. A reader who
+drags the panel open — or takes the whole page with it — is asking for a
+wider document, and the tables, the code and the diagrams take the width
+that is there. The lines of the prose keep a measure of their own, about
+forty Chinese characters, so that a wide panel does not make them hard to
+read; a table inside a quotation is not squeezed into the measure of a
+paragraph.
+
+A diagram follows the width of the panel it is shown in. The library draws a
+diagram at the size it needs and freezes that size when it draws it, so a
+panel that is widened afterwards — or a panel that takes the whole page — used
+to leave the diagram at the width it was drawn at. The viewer takes the size
+into its own hands: the drawing keeps its natural size, and the viewer scales
+it to the width it is given. A drawing that is narrower than its place keeps
+its own size, because blowing it up would make its letters larger than the
+letters around it.
+
+A diagram that is wider than its place is scaled down a long way, and a
+reader has to be able to read it. The viewer therefore carries three
+controls — zoom out, zoom in, and fit to the width — and the scale it is at.
+The step of the zoom doubles while the drawing is smaller than its own size,
+so three clicks take the reader from "the whole of it at once" to "as large
+as it is"; past that size it grows gently. The drawing may also be dragged
+with the pointer, and the wheel zooms when the keyboard is held down. The
+keyboard reaches it as well: `+`, `-` and `0`.
+
+The controls use the tokens of the page and no colour of their own, and they
+say what they are: every one of them carries a name for the screen reader.
 
 The conversation reads as the app's own transcript: what was asked and
 what the agent answered. A question is a question - the owner's, a
@@ -675,6 +809,43 @@ Three things keep the guests out of each other's way:
   guests have open, and a guest that looks at a file sees it change under
   them instead of working on a text that is no longer there.
 
+### The owner sees the room
+
+The owner of a shared conversation is not a guest of it: it holds the
+conversation and does not write in it. It still has to see who is in the room
+and who is writing, because that is the one thing that says whether somebody
+is there at all.
+
+So the owner gets the room of every share of its conversation, in the right
+corner of the conversation header. The widget is **folded away by default**:
+the header of a conversation is the app's own, and a sentence about the
+guests does not belong in it while the owner is working. What stays in the
+header is a small pill of faces — and the sign of a guest that is writing,
+because that is the one thing that must not wait for a click. A click opens
+the panel: every guest, its name, and the file it has open.
+
+- **Who is there.** Every guest of every share of the conversation, with the
+  face it has everywhere else: the colour of a guest follows its id, so the
+  dot of the guest in the room, the cursor of the guest in a document and the
+  face of the guest in the header are one and the same colour.
+- **Who is writing.** A guest says that it is writing while it types, and says
+  that it stopped when it stops. The words of a guest expire on their own
+  after six seconds: a guest that closes its tab in the middle never says
+  that it stopped, and the sign of a guest that is gone must not stay behind.
+- **A name, not an id.** The guest names itself in the header of its own
+  page, and the name is what the owner sees. It is kept in the storage of the
+  browser of the guest, so it is still there the next time.
+
+The room of the owner is a **stream**, not a poll: `GET
+/api/remote-control/presence?sessionId=…` is one answer that never ends, and
+every change of the room is one frame of it. The route is behind the browser
+session of the owner, like every other route of the owner. The Host says that
+it is alive every twenty seconds, because a stream that says nothing for a
+while is cut by the proxies between the browser and the Host.
+
+The guest sees the same room on its own page: the panel of the side column
+lists the other guests and marks the one that is writing.
+
 ### The queue of a conversation
 
 The Host digests the messages of a conversation one at a time: the agent works
@@ -738,6 +909,28 @@ annotation, so the agent knows what is being talked about.
 The drafting is the one of the Markdown preview plugin, moved here so
 that a guest may use it too: the Host owns the model, the page only
 speaks HTTP to it.
+
+Picking a passage offers a small pill next to it — and only the pill. The
+panel waits for the guest to ask for it: a panel that opens over a document
+nobody asked about is an interruption, and it takes the focus away from the
+passage that was picked. The pill goes when the passage goes, and the panel
+stays while the guest writes in it — the writing is worth more than the
+offer.
+
+The panel carries the passage it is about, so the guest sees what is being
+talked about, and it says what it is for. Nothing of it is louder than the
+document it belongs to: the colours are the page's own, the controls are
+24 pixels wide, and every one of them carries a name for the screen reader.
+
+### A write that is refused does not take the writing with it
+
+The file of a project moves on while a guest is writing in it — the agent
+rewrote it, or another guest saved it. The write is refused, and the text
+of the guest is **not** thrown away: the document keeps it, the guest is
+told that it did not reach the file, and one button puts it there.
+
+A text that vanishes without a word is a text that is lost, and the writing
+of a guest is worth more than the tidiness of the file.
 
 ### A guest may send a picture or a file
 

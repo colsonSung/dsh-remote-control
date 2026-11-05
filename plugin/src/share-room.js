@@ -10,6 +10,18 @@
  * guest, so it is already the one place where the guests of a share meet.
  */
 
+import { guestColor } from './share-identity.js'
+
+/**
+ * How long a guest is taken to be typing.
+ *
+ * A guest says that it is typing while it types, and says that it stopped when
+ * it stops. A guest that closes its tab in the middle says neither, so the
+ * words of the room expire: the indicator of a guest that is gone must not
+ * stay behind.
+ */
+export const SHARE_TYPING_TTL_MS = 6000
+
 /**
  * One guest of a room.
  *
@@ -18,25 +30,36 @@
  * @property {string} name the name the guest shows
  * @property {string} file the file the guest has open, if any
  * @property {boolean} editing whether the guest holds the file for editing
+ * @property {boolean} typing whether the guest is typing right now
+ * @property {number} typingAt when the guest last said it was typing
  * @property {number} since when the guest joined, in milliseconds
  */
 
 /**
  * @param {string} shareId
- * @returns {{ id: string, guests: Map<string, RoomGuest>, sinks: Set<(frame: string) => void>, locks: Map<string, string> }}
+ * @returns {{ id: string, guests: Map<string, RoomGuest>, sinks: Set<(frame: string) => void>, owners: Set<(frame: string) => void>, locks: Map<string, string> }}
  */
 function createRoom(shareId) {
-  return { id: shareId, guests: new Map(), sinks: new Set(), locks: new Map() }
+  return { id: shareId, guests: new Map(), sinks: new Set(), owners: new Set(), locks: new Map() }
 }
 
 /**
  * The rooms of every share.
  *
+ * @param {{ onPresence?: (shareId: string) => void, now?: () => number }} [options]
+ *   the hook that hears about a change of the room, so the owner of the share
+ *   can be told, and the clock of the room
  * @returns {{ room: (shareId: string) => any, drop: (shareId: string) => void, size: () => number }}
  */
-export function createShareRooms() {
+export function createShareRooms(options = {}) {
   /** @type {Map<string, ReturnType<typeof createRoom>>} */
   const rooms = new Map()
+  // The owner of a share is not a guest of its room, but the owner has to see
+  // who is in the room: the hook carries every change of the room out of it.
+  const onPresence = typeof options.onPresence === 'function' ? options.onPresence : () => {}
+  // The clock of the room. It is the clock of the Host, so the words of a
+  // guest expire on the same time everywhere.
+  const clock = typeof options.now === 'function' ? options.now : () => Date.now()
 
   const room = (shareId) => {
     let found = rooms.get(shareId)
@@ -53,17 +76,28 @@ export function createShareRooms() {
    * @param {ReturnType<typeof createRoom>} room
    * @returns {{ guests: RoomGuest[], locks: { path: string, guest: string }[] }}
    */
-  const view = (room) => ({
-    guests: [...room.guests.values()].map((guest) => ({
-      id: guest.id,
-      name: guest.name,
-      file: guest.file,
-      editing: guest.editing,
-      since: guest.since,
-      seen: guest.seen,
-    })),
-    locks: [...room.locks.entries()].map(([path, guest]) => ({ path, guest })),
-  })
+  const view = (room) => {
+    const now = clock()
+    return {
+      guests: [...room.guests.values()].map((guest) => ({
+        id: guest.id,
+        name: guest.name,
+        file: guest.file,
+        editing: guest.editing,
+        // A guest that said it was typing is taken to be typing until its
+        // words run out: a guest that closed its tab says nothing at all.
+        typing: guest.typing === true && now - guest.typingAt < SHARE_TYPING_TTL_MS,
+        typingAt: guest.typingAt,
+        since: guest.since,
+        seen: guest.seen,
+        // The colour of the guest is the same everywhere it is shown: in the
+        // room of the conversation, in a document the guests write together,
+        // and in the header of the owner.
+        color: guestColor(guest.id),
+      })),
+      locks: [...room.locks.entries()].map(([path, guest]) => ({ path, guest })),
+    }
+  }
 
   /**
    * Hand one frame to every guest of the room.
@@ -72,7 +106,7 @@ export function createShareRooms() {
    * @param {any} frame
    */
   const broadcast = (room, frame) => {
-    if (room.sinks.size === 0) return
+    if (room.sinks.size === 0 && room.owners.size === 0) return
     const line = `data: ${JSON.stringify(frame)}\n\n`
     for (const sink of room.sinks) {
       try {
@@ -81,6 +115,24 @@ export function createShareRooms() {
         // A guest that is gone takes its sink with it; the others carry on.
       }
     }
+    for (const sink of room.owners) {
+      try {
+        sink(line)
+      } catch (error) {
+        // The owner that went away takes its sink with it.
+      }
+    }
+  }
+
+  /**
+   * Say who is in the room, to the guests and to the owner.
+   *
+   * @param {string} shareId
+   */
+  const announce = (shareId) => {
+    const found = room(shareId)
+    broadcast(found, { kind: 'presence', ...view(found) })
+    onPresence(shareId)
   }
 
   return {
@@ -98,7 +150,7 @@ export function createShareRooms() {
      */
     sweep(shareId, olderThan) {
       const found = room(shareId)
-      const now = Date.now()
+      const now = clock()
       let forgotten = 0
       for (const [id, guest] of found.guests) {
         if (now - guest.seen < olderThan) continue
@@ -106,8 +158,8 @@ export function createShareRooms() {
         found.guests.delete(id)
         forgotten += 1
       }
-      if (forgotten > 0) broadcast(found, { kind: 'presence', ...view(found) })
-      if (found.guests.size === 0 && found.sinks.size === 0) rooms.delete(shareId)
+      if (forgotten > 0) announce(shareId)
+      if (found.guests.size === 0 && found.sinks.size === 0 && found.owners.size === 0) rooms.delete(shareId)
       return forgotten
     },
 
@@ -129,8 +181,10 @@ export function createShareRooms() {
           name: name.length > 0 ? name : `guest-${id.slice(0, 4)}`,
           file: '',
           editing: false,
-          since: Date.now(),
-          seen: Date.now(),
+          typing: false,
+          typingAt: 0,
+          since: clock(),
+          seen: clock(),
         })
       } else if (name.length > 0) {
         entry.name = name
@@ -165,7 +219,28 @@ export function createShareRooms() {
       if (typeof patch.editing === 'boolean') {
         entry.editing = patch.editing === true && entry.file.length > 0
       }
-      entry.seen = Date.now()
+      entry.seen = clock()
+      return entry
+    },
+
+    /**
+     * A guest says that it is typing, or that it stopped.
+     *
+     * The words expire on their own: a guest that closes its tab never says
+     * that it stopped, and the room must not keep it as a guest that writes.
+     *
+     * @param {string} shareId
+     * @param {string} guestId
+     * @param {boolean} typing
+     * @returns {RoomGuest | undefined}
+     */
+    setTyping(shareId, guestId, typing) {
+      const found = room(shareId)
+      const entry = found.guests.get(guestId)
+      if (entry === undefined) return undefined
+      entry.typing = typing === true
+      entry.typingAt = clock()
+      entry.seen = clock()
       return entry
     },
 
@@ -181,11 +256,11 @@ export function createShareRooms() {
       if (entry === undefined) return
       if (entry.editing && found.locks.get(entry.file) === guestId) found.locks.delete(entry.file)
       found.guests.delete(guestId)
-      if (found.guests.size === 0 && found.sinks.size === 0) {
+      if (found.guests.size === 0 && found.sinks.size === 0 && found.owners.size === 0) {
         rooms.delete(shareId)
         return
       }
-      broadcast(found, { kind: 'presence', ...view(found) })
+      announce(shareId)
     },
 
     /**
@@ -284,8 +359,37 @@ export function createShareRooms() {
       found.sinks.add(sink)
       return () => {
         found.sinks.delete(sink)
-        if (found.guests.size === 0 && found.sinks.size === 0) rooms.delete(shareId)
+        if (found.guests.size === 0 && found.sinks.size === 0 && found.owners.size === 0) rooms.delete(shareId)
       }
+    },
+
+    /**
+     * Listen to the room as its owner.
+     *
+     * The owner is not a guest: it holds the conversation and does not write
+     * in it. It still has to see who is in the room, so it hears the same
+     * frames the guests hear.
+     *
+     * @param {string} shareId
+     * @param {(line: string) => void} sink receives the frames of the room
+     * @returns {() => void} the way to stop listening
+     */
+    subscribeOwner(shareId, sink) {
+      const found = room(shareId)
+      found.owners.add(sink)
+      return () => {
+        found.owners.delete(sink)
+        if (found.guests.size === 0 && found.sinks.size === 0 && found.owners.size === 0) rooms.delete(shareId)
+      }
+    },
+
+    /**
+     * Say who is in the room, to the guests and to the owner.
+     *
+     * @param {string} shareId
+     */
+    announce(shareId) {
+      announce(shareId)
     },
 
     /**

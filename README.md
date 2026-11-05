@@ -22,7 +22,9 @@ second, stripped-down mobile UI to build, and none to keep in step.
 | **Trusted devices** | a phone you trust skips the code from then on |
 | **Revocation** | take a device offline now, or revoke it until you restore it |
 | **A tunnel that survives an event stream** | a response that never ends is forwarded chunk by chunk, so the phone sees the output as it happens |
-| **Payloads that fit in a phone's budget** | a busy session's snapshot is gzipped and marked, which is the difference between seconds of "Loading history…" and a fraction of one |
+| **Payloads that fit in a phone's budget** | every response travels compressed — with brotli, which sees across the whole bundle where gzip cannot — and the phone's browser unpacks it on its own |
+| **A session that does not expire under the phone** | the host keeps the event stream alive and mints the session itself, so the phone keeps its place instead of reconnecting |
+| **A phone that is not asked for the local network** | the inspector of the desktop is a local address; the phone is not offered it, so no permission prompt and no retry loop |
 | **A relay that is yours** | the relay is a small standalone server you can deploy on a VPS, or run on your own network |
 | **A conversation you can share** | a link and an 8-digit passcode open **one** conversation to a guest — never the rest of the Harness |
 
@@ -41,11 +43,23 @@ sessions, the owner's credentials or the owner's other shares.
 | **Read or write** | a read share shows the conversation; a write share lets the guest send messages into it |
 | **A queue, not a stampede** | the agent answers one message at a time, and every guest of the share sees the same queue at the same moment |
 | **Documents together** | the guests of a share may edit one file at the same time, and the agent's own writes are guarded by the version of the file |
+| **The owner sees who is there** | the guests of the share appear in the corner of the conversation, and the one that is writing is marked while it writes |
 
 The owner opens **Settings → Remote Control → Share this conversation**, gets the
 link and the passcode, and can revoke the link at any time. The relay carries
 the guest traffic in its own namespace (`/s/<share id>/…`) and rewrites it for
 the host, so a guest can never name another route of the host.
+
+A guest names itself in the header of its own page, and the owner sees that
+name — not an id — in the corner of the conversation, next to the button that
+shared it. The widget is folded away: the header keeps a small pill of faces,
+and a click opens the list of the guests. A guest that is writing says so, and
+the owner sees the sign of it while the words are on their way. The room is a
+live stream, so the owner sees the guests arrive and leave without asking.
+
+> 中文：访客在页面顶部写上自己的名字，主人就能在会话右上角看到「谁在线」以及「谁
+> 正在输入」——正在输入的人会带一个跳动的动画提示。控件默认收起，只留一排小头像，
+> 点一下才展开名单。这个状态是实时推送的，不用刷新。
 
 The share feature needs a relay that knows it: **relay 1.2.0** or newer.
 

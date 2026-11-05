@@ -324,6 +324,7 @@ async function startRelay(options = {}) {
     devicePath: options.devicePath,
     requestTimeoutMs: options.requestTimeoutMs,
     interactiveRequestTimeoutMs: options.interactiveRequestTimeoutMs,
+    longRequestTimeoutMs: options.longRequestTimeoutMs,
     log: () => {},
   })
   const { port } = await relay.listen({ host: '127.0.0.1', port: 0 })
@@ -342,12 +343,13 @@ test('a request that waits for a person at the desktop gets a longer window', as
     relayUrl: url,
     deviceId: 'device-pick',
     localBaseUrl: upstream.url,
-    stallPaths: ['/api/directoryPicker/pick', '/api/session/list'],
+    stallPaths: ['/api/directoryPicker/pick', '/api/session/list', '/assets/app.js'],
   }).connect()
   t.after(() => host.close())
 
-  // An ordinary request the host never answers runs out of time.
-  const ordinary = await fetch(`${url}/api/session/list`)
+  // An ordinary request the host never answers runs out of time. A file is
+  // ordinary: the host reads it in a moment.
+  const ordinary = await fetch(`${url}/assets/app.js`)
   assert.equal(ordinary.status, 504)
   assert.match(await ordinary.text(), /did not answer in time/)
 
@@ -359,6 +361,37 @@ test('a request that waits for a person at the desktop gets a longer window', as
     new Promise((resolve) => setTimeout(() => resolve('still waiting'), 600)),
   ])
   assert.equal(raced, 'still waiting', 'the picker must not be timed out like an ordinary request')
+  await pending.catch(() => {})
+})
+
+test('the app\'s own data gets a longer window than a file', async (t) => {
+  const upstream = await startUpstream()
+  const { relay, url } = await startRelay({
+    requestTimeoutMs: 150,
+    longRequestTimeoutMs: 3_000,
+  })
+  t.after(async () => {
+    await relay.close()
+    await upstream.close()
+  })
+
+  const host = await new FakeHost({
+    relayUrl: url,
+    deviceId: 'device-data',
+    localBaseUrl: upstream.url,
+    stallPaths: ['/api/session/list'],
+  }).connect()
+  t.after(() => host.close())
+
+  // The session list of a busy machine is megabytes of JSON, and the host
+  // needs the time to build it. A phone that asks for it must not be told
+  // "no answer in time" while the host is still working.
+  const pending = fetch(`${url}/api/session/list`)
+  const raced = await Promise.race([
+    pending.then((response) => response.status),
+    new Promise((resolve) => setTimeout(() => resolve('still waiting'), 600)),
+  ])
+  assert.equal(raced, 'still waiting', 'the data of the app must not be timed out like a file')
   await pending.catch(() => {})
 })
 

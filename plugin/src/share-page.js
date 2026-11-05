@@ -14,6 +14,8 @@
 
 import { highlightCode, languageOf } from './share-highlight.js'
 import { fileIconSvg, fileKindOf, fileSizeLabel } from './share-files.js'
+import { GUEST_COLORS } from './share-identity.js'
+import { DIAGRAM_CSS, diagramMathBundle, diagramRuntime } from './share-diagram.js'
 import { markdownToHtml } from './share-markdown.js'
 
 /**
@@ -78,6 +80,7 @@ export function renderGuestPage(options = {}) {
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>${title}</title>
 <style>
+${DIAGRAM_CSS}
 :root {
   color-scheme: light dark;
   /* The palette of the Harness app itself, measured from the running host.
@@ -100,6 +103,7 @@ export function renderGuestPage(options = {}) {
   --code-number: #b5561a;
   --code-comment: #8a8f98;
   --code-punct: #61666b;
+  --danger: #c0392b;
   --shadow-card: 0 1px 2px rgba(15, 17, 21, 0.06), 0 4px 14px -6px rgba(15, 17, 21, 0.10);
   --shadow-float: 0 2px 6px rgba(15, 17, 21, 0.08), 0 20px 48px -16px rgba(15, 17, 21, 0.24);
   --radius-sm: 6px;
@@ -202,6 +206,25 @@ body[data-side="collapsed"] .side { overflow: hidden; border-right: 0; }
 .presence-guest[data-editing="true"] .presence-dot { background: var(--code-string); }
 .presence-file { color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .presence-locked { color: var(--code-number); }
+/* A guest that is writing says so with three dots that travel: the owner of
+   the conversation sees the same sign, and the guest that is writing sees it
+   in the others. */
+.presence-guest[data-typing="true"] { color: var(--text); }
+.presence-dots { display: inline-flex; align-items: center; gap: 3px; flex: none; }
+.presence-dots i {
+  width: 4px; height: 4px; border-radius: 999px; background: currentColor; opacity: .3;
+  animation: presence-blink 1.2s ease-in-out infinite;
+}
+.presence-dots i:nth-child(2) { animation-delay: .16s; }
+.presence-dots i:nth-child(3) { animation-delay: .32s; }
+.presence-typing { color: var(--muted); }
+@keyframes presence-blink {
+  0%, 70%, 100% { opacity: .3; transform: translateY(0); }
+  35% { opacity: 1; transform: translateY(-1px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .presence-dots i { animation: none; opacity: .7; }
+}
 .files-head {
   padding: 12px 16px 8px; display: flex; align-items: center; justify-content: space-between;
   font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--faint);
@@ -243,6 +266,19 @@ body[data-panel="open"] .main { margin-right: var(--file-panel-width, 520px); }
 .top-tool:hover { color: var(--text); border-color: var(--line-strong); }
 .top-tool[aria-pressed="true"] { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 30%, transparent); color: var(--accent); }
 .top-tool-icon { padding: 0 7px; }
+/* The name of the guest: the owner of the conversation and the other guests
+   see it, so it stands in the header where it can be changed at any time. */
+.whoami {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px 0 8px;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--muted);
+}
+.whoami-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--accent); flex: none; }
+.whoami-input {
+  width: 92px; padding: 0; border: 0; background: none; color: var(--text);
+  font-family: inherit; font-size: 12px;
+}
+.whoami-input:focus { outline: none; }
+.whoami-input::placeholder { color: var(--faint); }
 .theme-moon { display: none; }
 :root[data-theme="dark"] .theme-sun { display: none; }
 :root[data-theme="dark"] .theme-moon { display: block; }
@@ -388,31 +424,49 @@ body[data-panel="open"] .main { margin-right: var(--file-panel-width, 520px); }
 .composer-note { padding: 8px 16px 0; color: var(--faint); font-size: 12px; }
 .composer-card.composer-readonly { padding: 14px 16px; }
 .composer-card.composer-readonly .composer-note { padding: 0; }
+/* The offer of an annotation: a small pill next to the passage the reader
+   picked. It is quiet on purpose — the passage is the content, and the pill
+   only says that the passage can be talked about. */
 .annotate-bar {
-  position: absolute; z-index: 8; display: none; align-items: center; gap: 8px;
-  padding: 6px 8px; border: 1px solid var(--line); border-radius: 999px;
+  position: absolute; z-index: 8; display: none; align-items: center;
+  padding: 2px; border: 1px solid var(--line); border-radius: 999px;
   background: var(--surface); box-shadow: var(--shadow-float);
 }
 .annotate-bar[data-open="true"] { display: flex; }
-.annotate-button {
-  height: 26px; padding: 0 10px; border: 1px solid var(--line); border-radius: 999px;
-  background: var(--surface-2); color: var(--muted); font-size: 12px; cursor: pointer;
-}
-.annotate-button:disabled { opacity: .6; cursor: default; }
 .annotate-bar-button {
-  height: 26px; padding: 0 10px; border: 0; border-radius: 999px;
-  background: var(--accent); color: var(--accent-contrast); font-size: 12px; cursor: pointer;
+  display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px 0 8px;
+  border: 0; border-radius: 999px; background: transparent; color: var(--text);
+  font-size: 12px; cursor: pointer;
 }
+.annotate-bar-button:hover { background: var(--surface-2); }
+.annotate-bar-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.annotate-bar-button svg { display: block; color: var(--muted); }
+.annotate-bar-button:hover svg { color: var(--accent); }
+/* The panel: a card with a head, the passage that was picked, what has to
+   change, and the wording the agent proposes. */
 .annotate-panel {
-  position: absolute; z-index: 9; display: none; flex-direction: column; gap: 8px; width: 300px;
+  position: absolute; z-index: 9; display: none; flex-direction: column; gap: 10px; width: 320px;
   padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-md);
   background: var(--surface); box-shadow: var(--shadow-float);
 }
 .annotate-panel[data-open="true"] { display: flex; }
+.annotate-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.annotate-title { font-size: 12px; font-weight: 600; color: var(--text); }
+.annotate-close {
+  display: grid; place-items: center; width: 24px; height: 24px; flex: none; padding: 0;
+  border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--muted); cursor: pointer;
+}
+.annotate-close:hover { background: var(--surface-2); color: var(--text); }
+.annotate-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.annotate-quote {
+  margin: 0; padding: 2px 0 2px 10px; border-left: 2px solid var(--line-strong);
+  color: var(--muted); font-size: 12px; line-height: 1.5; max-height: 54px; overflow: hidden;
+}
+.annotate-quote:empty { display: none; }
 .annotate-panel textarea {
-  width: 100%; min-height: 64px; padding: 8px; border: 1px solid var(--line-strong);
+  width: 100%; min-height: 56px; padding: 8px 10px; border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm); background: var(--bg); color: var(--text); resize: vertical;
-  font-size: 13px; line-height: 1.5; outline: none;
+  font: inherit; font-size: 13px; line-height: 1.5; outline: none;
 }
 .annotate-panel textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .annotate-panel textarea:disabled { color: var(--muted); }
@@ -420,13 +474,24 @@ body[data-panel="open"] .main { margin-right: var(--file-panel-width, 520px); }
   padding: 8px 10px; border-radius: var(--radius-sm); background: var(--surface-2);
   color: var(--text); font-size: 12px; line-height: 1.5; max-height: 140px; overflow: auto;
 }
+.annotate-draft:empty { display: none; }
 .annotate-panel-actions { display: flex; align-items: center; gap: 8px; }
-.annotate-send {
-  margin-left: auto; height: 28px; padding: 0 12px; border: 0; border-radius: 999px;
-  background: var(--accent); color: var(--accent-contrast); font-size: 12px; cursor: pointer;
+.annotate-button {
+  height: 28px; padding: 0 10px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--muted); font-size: 12px; white-space: nowrap; cursor: pointer;
 }
+.annotate-button:hover { color: var(--text); border-color: var(--line-strong); }
+.annotate-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.annotate-button:disabled { opacity: .6; cursor: default; }
+.annotate-send {
+  margin-left: auto; height: 28px; padding: 0 12px; border: 0; border-radius: var(--radius-sm);
+  background: var(--accent); color: var(--accent-contrast); font-size: 12px; white-space: nowrap; cursor: pointer;
+}
+.annotate-send:hover { filter: brightness(1.06); }
+.annotate-send:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .annotate-send:disabled { background: var(--surface-3); color: var(--faint); cursor: default; }
 .annotate-error { color: var(--code-number); font-size: 12px; }
+.annotate-error:empty { display: none; }
 .composer-attach {
   display: grid; place-items: center; width: 28px; height: 28px; flex: none; padding: 0;
   border: 0; border-radius: 999px; background: var(--surface-2); color: var(--muted); cursor: pointer;
@@ -530,6 +595,16 @@ body[data-panel="max"] .max-restore { display: block; }
   display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-top: 1px solid var(--line);
   color: var(--faint); font-size: 12px;
 }
+/* The notice of a write that was refused: what did not reach the file, and
+   the one thing that puts it there. */
+.file-editor-note { color: var(--code-number); }
+.file-editor-again {
+  height: 26px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--text); font-size: 12px; white-space: nowrap; cursor: pointer;
+}
+.file-editor-again:hover { border-color: var(--accent); }
+.file-editor-again:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.file-editor-again:disabled { opacity: .6; cursor: default; }
 .file-editor-save {
   margin-left: auto; height: 28px; padding: 0 12px; border: 0; border-radius: 8px;
   background: var(--accent); color: var(--accent-contrast); font-size: 12px; cursor: pointer;
@@ -576,7 +651,18 @@ body[data-panel="max"] .max-restore { display: block; }
 .md .mermaid svg { max-width: 100%; height: auto; }
 /* A document in the panel is a document: the same marks, at the size of a
    document. */
-.file-markdown { padding: 4px 20px 28px; max-width: 820px; font-size: 14px; line-height: 1.65; }
+/* The document follows the panel. A panel that is wider gives the document
+   the width it can use: the tables, the code and the diagrams need it, and a
+   reader who drags the panel open is asking for exactly that.
+   The lines of the prose keep a measure of their own — about forty Chinese
+   characters — so that a wide panel does not make them hard to read. */
+.file-markdown { padding: 4px 20px 28px; width: 100%; font-size: 14px; line-height: 1.65; }
+/* The measure belongs to the text: a paragraph, a list item, a heading. The
+   containers around them — a list, a quotation, a table, a diagram — take the
+   width of the panel, so that a table inside a quotation is not squeezed
+   into the measure of a paragraph. */
+.file-markdown p, .file-markdown li, .file-markdown h1, .file-markdown h2,
+.file-markdown h3, .file-markdown h4, .file-markdown h5, .file-markdown h6 { max-width: 72ch; }
 .file-markdown h1 { font-size: 20px; } .file-markdown h2 { font-size: 17px; }
 .file-markdown h3 { font-size: 15px; } .file-markdown h4 { font-size: 14px; }
 .file-markdown p { margin: 0 0 10px; }
@@ -665,6 +751,10 @@ function guestShell(title, permission, id, writable) {
         </div>
       </div>
       <div class="top-tools">
+        <label class="whoami" title="The name the owner and the other guests see">
+          <span class="whoami-dot" id="whoamiDot"></span>
+          <input class="whoami-input" id="whoamiInput" type="text" maxlength="24" placeholder="Your name" aria-label="Your name">
+        </label>
         <button class="top-tool top-tool-icon" id="themeToggle" type="button" aria-label="Switch the theme" title="Switch the theme">
           <svg class="theme-sun" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="3.1" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.4v1.6M8 13v1.6M1.4 8h1.6M13 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
           <svg class="theme-moon" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
@@ -701,15 +791,25 @@ function guestShell(title, permission, id, writable) {
   </div>
   <div class="file-panel-body" id="fileBody"></div>
   <div class="annotate-bar" id="annotateBar" data-open="false">
-    <button class="annotate-bar-button" id="annotateStart" type="button">Ask the agent to change this</button>
+    <button class="annotate-bar-button" id="annotateStart" type="button" title="Ask the agent to change this" aria-label="Ask the agent to change this">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M11.1 2.6 13.4 4.9 5.6 12.7 2.8 13.2l.5-2.8 7.8-7.8Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+      <span>Annotate</span>
+    </button>
   </div>
   <div class="annotate-panel" id="annotatePanel" data-open="false">
+    <div class="annotate-head">
+      <span class="annotate-title">Ask the agent to change this</span>
+      <button class="annotate-close" id="annotateClose" type="button" aria-label="Close" title="Close">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <blockquote class="annotate-quote" id="annotateQuote"></blockquote>
     <textarea placeholder="What has to change here?"></textarea>
     <div class="annotate-draft"></div>
     <div class="annotate-error"></div>
     <div class="annotate-panel-actions">
       <button class="annotate-button" id="annotateDraft" type="button">Let the agent write it</button>
-      <button class="annotate-send" id="annotateSend" type="button" disabled>Send to the conversation</button>
+      <button class="annotate-send" id="annotateSend" type="button" disabled>Send</button>
     </div>
   </div>
 </div>`
@@ -812,6 +912,15 @@ function guestScript() {
   var fileIconSvg = (${fileIconSvg.toString()});
   var fileSizeLabel = (${fileSizeLabel.toString()});
   var markdown = (${markdownToHtml.toString()});
+  // The viewer of a diagram travels with it: a drawing is drawn at the size
+  // it needs, and the reader zooms into it when the whole of it is too much
+  // to read at once.
+  var diagramMath = (${diagramMathBundle.toString()})();
+  var diagram = (${diagramRuntime.toString()})(diagramMath);
+  // The palette of the guests travels with the page as well: it is written
+  // once, in the module the Host reads it from, so the colour of a guest is
+  // the same in every place it is shown.
+  var GUEST_COLORS = ${JSON.stringify(GUEST_COLORS)};
   var base = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
   var view = document.getElementById('view');
   var tree = document.getElementById('tree');
@@ -876,6 +985,16 @@ function guestScript() {
         });
       } catch (error) { return; }
       var run = mermaid.run({ nodes: [holder] });
+      if (run !== undefined && typeof run.then === 'function') {
+        run.then(function () {
+          // The drawing is there now: the viewer takes its size and lets the
+          // reader zoom into it.
+          var svg = holder.querySelector('svg');
+          if (svg === null || svg === undefined) return;
+          diagram.mount(holder, svg);
+        }).catch(function () { /* the code stays as code */ });
+        return;
+      }
       if (run !== undefined && typeof run.catch === 'function') {
         run.catch(function () { /* the code stays as code */ });
       }
@@ -1191,6 +1310,9 @@ function guestScript() {
   // sandbox of its own, a picture as a picture, and source as source.
   var currentFile = null;
   var currentRaw = null;
+  // The text the guest is editing: a write that was refused has to be able
+  // to send it again.
+  var editorText = '';
   var currentView = 'preview';
   var currentVersion = '';
   var editing = false;
@@ -1277,8 +1399,12 @@ function guestScript() {
     var host = document.querySelector('.file-panel-body');
     if (host === null) return;
     var hostBox = host.getBoundingClientRect();
+    var picked = text.trim();
+    // The same passage: the offer only moves. What the guest has written so
+    // far stays where it is — a selection that grows must not wipe it.
+    var same = annotateSelection !== null && annotateSelection.text === picked;
     annotateSelection = {
-      text: text.trim(),
+      text: picked,
       before: text.slice(0, 4000),
       path: currentFile ?? '',
     };
@@ -1288,12 +1414,22 @@ function guestScript() {
     annotateBar.style.left = Math.max(8, Math.min(left, hostBox.width - 200)) + 'px';
     annotateBar.setAttribute('data-open', 'true');
     annotatePanel.style.top = Math.max(44, top + 38) + 'px';
-    annotatePanel.style.left = Math.max(8, Math.min(left, hostBox.width - 316)) + 'px';
-    annotatePanel.setAttribute('data-open', 'true');
+    annotatePanel.style.left = Math.max(8, Math.min(left, hostBox.width - 336)) + 'px';
+    if (same) return;
+    // The panel is prepared for this passage, but it does not open: the
+    // reader says so. A panel that opens over a document nobody asked about
+    // is an interruption, and it takes the focus away from the passage.
     var area = annotatePanel.querySelector('textarea');
     area.value = '';
     area.disabled = false;
-    area.focus();
+    var quote = annotatePanel.querySelector('.annotate-quote');
+    if (quote !== null) quote.textContent = picked.length > 220 ? picked.slice(0, 220) + '…' : picked;
+    var draft = annotatePanel.querySelector('.annotate-draft');
+    if (draft !== null) draft.textContent = '';
+    var error = annotatePanel.querySelector('.annotate-error');
+    if (error !== null) error.textContent = '';
+    var send = annotatePanel.querySelector('.annotate-send');
+    if (send !== null) send.disabled = true;
   }
 
   function draftAnnotation() {
@@ -1355,12 +1491,13 @@ function guestScript() {
   var annotatePanel = document.getElementById('annotatePanel');
   if (annotateBar !== null && annotatePanel !== null) {
     document.getElementById('annotateStart').addEventListener('click', function () {
+      // The reader asked for it: the panel opens over the passage.
       var area = annotatePanel.querySelector('textarea');
       area.value = '';
       area.disabled = false;
-      area.focus();
       annotateBar.setAttribute('data-open', 'false');
       annotatePanel.setAttribute('data-open', 'true');
+      area.focus();
     });
     document.getElementById('annotateDraft').addEventListener('click', draftAnnotation);
     document.getElementById('annotateSend').addEventListener('click', sendAnnotation);
@@ -1370,12 +1507,27 @@ function guestScript() {
       if (annotatePanel.contains(event.target) || annotateBar.contains(event.target)) return;
       closeAnnotate();
     });
+    document.getElementById('annotateClose').addEventListener('click', closeAnnotate);
     // A selection in the preview offers the annotation.
     document.addEventListener('selectionchange', function () {
       var selection = window.getSelection();
-      if (selection === null || selection.isCollapsed) return;
-      var node = selection.anchorNode;
       var host = document.querySelector('.file-panel-body');
+      if (selection === null || selection.isCollapsed) {
+        // The passage is not picked any more: the offer goes with it. The
+        // panel stays while the guest writes in it — the writing is worth
+        // more than the offer.
+        if (annotatePanel.getAttribute('data-open') === 'true' &&
+            !annotatePanel.contains(document.activeElement)) {
+          closeAnnotate();
+          return;
+        }
+        annotateBar.setAttribute('data-open', 'false');
+        return;
+      }
+      // While the guest is typing in the editor, a selection means nothing:
+      // the offer would open over the text they are writing.
+      if (collab !== null) return;
+      var node = selection.anchorNode;
       if (node === null || host === null || !host.contains(node)) return;
       if (currentFile === null || !isTextual(currentFile)) return;
       openAnnotate(host);
@@ -1450,10 +1602,9 @@ function guestScript() {
   }
 
   function guestColor(id) {
-    var palette = ['#4176e6', '#7a3fb8', '#1a7f45', '#b5561a', '#0f8a8a', '#c0392b'];
     var sum = 0;
     for (var index = 0; index < String(id).length; index++) sum += String(id).charCodeAt(index);
-    return palette[sum % palette.length];
+    return GUEST_COLORS[sum % GUEST_COLORS.length];
   }
 
   function bytesToBase64(bytes) {
@@ -1516,18 +1667,27 @@ function guestScript() {
     wrap.appendChild(area);
     wrap.appendChild(foot);
     body.appendChild(wrap);
-    area.addEventListener('input', function () { save.disabled = area.value === currentRaw; });
+    editorText = area.value;
+    area.addEventListener('input', function () {
+      editorText = area.value;
+      save.disabled = area.value === currentRaw;
+    });
     save.addEventListener('click', function () {
       save.disabled = true;
       saveFile(area.value);
     });
   }
 
-  function saveFile(text) {
+  function saveFile(text, version) {
     fetch(base + 'api/edit', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ path: currentFile, content: text, version: editVersion, guest: guestId }),
+      body: JSON.stringify({
+        path: currentFile,
+        content: text,
+        version: version ?? editVersion,
+        guest: guestId,
+      }),
     }).then(function (response) {
       return response.json().then(function (data) { return { status: response.status, data: data }; });
     }).then(function (answer) {
@@ -1548,7 +1708,17 @@ function guestScript() {
         pre.textContent = String(answer.data?.current ?? '');
         note.appendChild(pre);
         var keep = el('div', 'file-editor-foot');
-        keep.appendChild(el('span', null, 'Your text was kept. Reload to start from the file as it is now.'));
+        keep.appendChild(el('span', null, 'Your text was kept.'));
+        var again = el('button', 'file-editor-again', 'Save anyway');
+        again.type = 'button';
+        again.addEventListener('click', function () {
+          again.disabled = true;
+          // The guest has seen what the file holds now, and says what it
+          // should hold instead: the text that is on the screen.
+          saveFile(editorText, answer.data?.version ?? '');
+        });
+        keep.appendChild(again);
+        note.appendChild(keep);
         body.insertBefore(note, body.firstChild);
         return;
       }
@@ -1566,6 +1736,48 @@ function guestScript() {
       failed.appendChild(el('div', null, 'The file could not be written.'));
       document.getElementById('fileBody').insertBefore(failed, document.getElementById('fileBody').firstChild);
     });
+  }
+
+  /**
+   * Tell the guest that their writing did not reach the file, and give them
+   * the one thing that puts it there.
+   *
+   * @param {string} version the version the file holds now
+   */
+  function showSaveFailure(version) {
+    if (collab === null) return;
+    var foot = document.querySelector('.file-editor-foot');
+    if (foot === null) return;
+    foot.textContent = '';
+    var note = el('span', 'file-editor-note', 'Not saved: the file changed while you were editing.');
+    foot.appendChild(note);
+    var again = el('button', 'file-editor-again', 'Save anyway');
+    again.type = 'button';
+    again.addEventListener('click', function () {
+      again.disabled = true;
+      fetch(base + 'api/edit', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          path: collab.path,
+          content: collab.text.toString(),
+          version: version,
+          guest: guestId,
+        }),
+      }).then(function (response) { return response.json(); }).then(function (answer) {
+        if (answer !== undefined && answer.ok === true) {
+          foot.textContent = '';
+          foot.appendChild(el('span', null, 'Saved to the file.'));
+          return;
+        }
+        again.disabled = false;
+        note.textContent = answer?.error ?? 'The file could not be written.';
+      }).catch(function () {
+        again.disabled = false;
+        note.textContent = 'The host could not be reached.';
+      });
+    });
+    foot.appendChild(again);
   }
 
   function showFile(path, title, pathLabel, size) {
@@ -1746,6 +1958,28 @@ function guestScript() {
     }).then(function (response) { return response.ok ? response.json() : undefined; }).catch(function () { return undefined; });
   }
 
+  // The name of the guest. The owner of the conversation sees who is in the
+  // room, and a name is what tells one guest from another: an id cannot.
+  var nameInput = document.getElementById('whoamiInput');
+  var nameDot = document.getElementById('whoamiDot');
+  if (nameDot !== null) nameDot.style.background = guestColor(guestId);
+  if (nameInput !== null) {
+    nameInput.value = guestName;
+    var sayName = function () {
+      guestName = nameInput.value.trim().slice(0, 24);
+      window.localStorage.setItem('dsh-share-guest-name', guestName);
+      // The room learns the name at once: the owner sees the new one.
+      roomPost({ action: 'hello' }).then(function (view) { applyPresence(view); });
+    };
+    nameInput.addEventListener('change', sayName);
+    nameInput.addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      sayName();
+      nameInput.blur();
+    });
+  }
+
   // The id of the message this guest sent last: the Host answers with it, and
   // the bar needs it to tell the guest which message is their own.
   var myMessageId = '';
@@ -1813,8 +2047,22 @@ function guestScript() {
     others.forEach(function (guest) {
       var row = el('div', 'presence-guest');
       row.setAttribute('data-editing', guest.editing === true ? 'true' : 'false');
-      row.appendChild(el('span', 'presence-dot'));
+      row.setAttribute('data-typing', guest.typing === true ? 'true' : 'false');
+      if (guest.typing === true) {
+        // The sign of a guest that is writing: three dots that travel.
+        var dots = el('span', 'presence-dots');
+        dots.appendChild(el('i'));
+        dots.appendChild(el('i'));
+        dots.appendChild(el('i'));
+        row.appendChild(dots);
+      }
+      var dot = el('span', 'presence-dot');
+      // The Host carries the colour of the guest, so the owner of the
+      // conversation sees the same face as the other guests do.
+      dot.style.background = guest.color || guestColor(guest.id);
+      row.appendChild(dot);
       row.appendChild(el('span', null, guest.name));
+      if (guest.typing === true) row.appendChild(el('span', 'presence-typing', 'is typing'));
       if (guest.file) {
         var file = el('span', 'presence-file', (guest.editing === true ? 'editing ' : 'viewing ') + guest.file);
         row.appendChild(file);
@@ -2046,6 +2294,26 @@ function guestScript() {
       });
     };
 
+    // The guest says that it is writing, so the owner of the conversation sees
+    // that the words are on their way before they arrive.
+    var writing = false;
+    var writingBeat = null;
+    var setWriting = function (on) {
+      if (on === writing) return;
+      writing = on;
+      roomPost({ action: 'typing', typing: on });
+      if (writingBeat !== null) {
+        window.clearInterval(writingBeat);
+        writingBeat = null;
+      }
+      if (!on) return;
+      // The words of a guest expire on their own, so a guest that writes for
+      // a while says again that it is writing.
+      writingBeat = window.setInterval(function () {
+        roomPost({ action: 'typing', typing: true });
+      }, 2500);
+    };
+
     var upload = function (file) {
       var reader = new FileReader();
       reader.onload = function () {
@@ -2072,7 +2340,14 @@ function guestScript() {
       input.style.height = Math.min(input.scrollHeight, 220) + 'px';
     };
     var ready = function () { send.disabled = input.value.trim().length === 0; };
-    input.addEventListener('input', function () { grow(); ready(); });
+    input.addEventListener('input', function () {
+      grow();
+      ready();
+      // The guest writes: the owner of the conversation sees that the words
+      // are on their way, and stops seeing it when the guest stops.
+      setWriting(input.value.trim().length > 0);
+    });
+    input.addEventListener('blur', function () { setWriting(false); });
     input.addEventListener('keydown', function (event) {
       if (event.key !== 'Enter' || event.shiftKey) return;
       event.preventDefault();
@@ -2085,6 +2360,8 @@ function guestScript() {
       var text = input.value.trim();
       if (text.length === 0 && pending.length === 0) return;
       send.disabled = true;
+      // The words are on their way: the guest is not writing any more.
+      setWriting(false);
       // The guest says who it is: the Host tells every guest of the share who
       // wrote what, so a message in the queue carries its sender.
       var payload = { text: text, guest: guestId, from: guestName };
@@ -2193,6 +2470,15 @@ function guestScript() {
         if (collab !== null && payload.path === collab.path) {
           var note = document.querySelector('.file-editor-foot span');
           if (note !== null) note.textContent = 'Saved to the file (' + (payload.length ?? 0) + ' characters).';
+        }
+        return;
+      }
+      if (payload.kind === 'collab-save-failed') {
+        // The file moved on while the guest was writing. What they wrote is
+        // still on their screen, and they are told that it did not reach the
+        // file.
+        if (collab !== null && payload.path === collab.path) {
+          showSaveFailure(payload.version ?? '');
         }
         return;
       }

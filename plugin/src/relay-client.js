@@ -44,7 +44,11 @@ import { createHash } from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
 import { promisify } from 'node:util'
-import { gzip } from 'node:zlib'
+import {
+  brotliCompress,
+  constants as zlibConstants,
+  gzip,
+} from 'node:zlib'
 import { WebSocket as NodeWebSocket } from 'ws'
 
 import {
@@ -92,6 +96,8 @@ const DEFAULT_OPTIONS = {
   registrationTimeoutMs: 15_000,
   /** How long `stop()` waits for the sockets to close before terminating. */
   closeTimeoutMs: 2_000,
+  /** How long an event stream may stay quiet before the tunnel says something. */
+  keepAliveMs: 60_000,
 }
 
 /** Hop-by-hop request headers that must not be forwarded upstream. */
@@ -172,8 +178,65 @@ const STREAM_CHUNK_BYTES = 64 * 1024
  */
 const LARGE_BODY_STREAM_BYTES = 512 * 1024
 
+/**
+ * How long the session of the phone lasts.
+ *
+ * The server mints its own cookie for thirty days; the phone keeps the same
+ * span, so both forget the session at the same time.
+ */
+const SESSION_COOKIE_MAX_AGE = 2592000
+
+/**
+ * How long an event stream may stay quiet before the tunnel says something.
+ *
+ * The relay cuts a stream that says nothing for five minutes, and a phone
+ * that only reads the conversation says nothing for a long time. The tunnel
+ * therefore keeps the stream alive with a comment.
+ */
+const STREAM_KEEPALIVE_MS = 60_000
+
+/**
+ * The comment that keeps an event stream alive.
+ *
+ * A line that starts with a colon is a comment in Server-Sent Events, and
+ * every client ignores it.
+ */
+const STREAM_KEEPALIVE_COMMENT = ': keep-alive\n\n'
+
+
+
 /** The gzip implementation, as a promise. */
 const gzipAsync = promisify(gzip)
+
+/**
+ * The brotli implementation, as a promise.
+ *
+ * It is not available in every runtime the plugin runs in, so the caller asks
+ * for it defensively.
+ */
+const brotliCompressAsync = typeof brotliCompress === 'function' ? promisify(brotliCompress) : undefined
+
+/**
+ * The brotli quality the tunnel compresses with.
+ *
+ * Six is the point where the bytes stop getting smaller fast enough: the
+ * bundle of every plugin shrinks by 9% against gzip, and the Host compresses
+ * on the request path — the phone waits for it. A higher quality costs seconds
+ * on a nine-megabyte body and buys a percent.
+ */
+const BROTLI_QUALITY = 6
+
+/**
+ * The window brotli may look back over.
+ *
+ * Twenty-four bits is sixteen megabytes: the whole body of the client bundles
+ * of every plugin, which is what gzip cannot see across.
+ */
+const BROTLI_WINDOW = 24
+
+const BROTLI_PARAM_QUALITY = zlibConstants.BROTLI_PARAM_QUALITY
+const BROTLI_PARAM_LGWIN = zlibConstants.BROTLI_PARAM_LGWIN
+const BROTLI_PARAM_SIZE_HINT = zlibConstants.BROTLI_PARAM_SIZE_HINT
 
 /** Subprotocol tokens allowed by RFC 6455 (`ws` validates against this too). */
 const SUBPROTOCOL_PATTERN = /^[!#$%&'*+\-.0-9A-Z^_`|a-z~]+$/
@@ -264,6 +327,41 @@ function readCookie(headers, name) {
 }
 
 /**
+ * Add one cookie to a request's `Cookie` header.
+ *
+ * @param {unknown} raw the header the phone brought
+ * @param {string} cookie the cookie to add, as `name=value`
+ * @returns {string}
+ */
+function appendCookie(raw, cookie) {
+  const current = Array.isArray(raw) ? raw.join('; ') : String(raw ?? '')
+  if (current.length === 0) return cookie
+  return `${current}; ${cookie}`
+}
+
+/**
+ * The browser session cookie of the local server, as it was minted.
+ *
+ * The server names the cookie after the authority it serves, so only that one
+ * cookie is the session.
+ *
+ * @param {unknown} raw the `Set-Cookie` header of the answer
+ * @param {string} authority `host:port` of the local server
+ * @returns {string | undefined} the cookie as `name=value`
+ */
+function sessionCookieOf(raw, authority) {
+  const name = sessionCookieName(authority)
+  const list = Array.isArray(raw) ? raw : raw === undefined || raw === null ? [] : [raw]
+  for (const entry of list) {
+    const at = entry.indexOf('=')
+    if (at === -1) continue
+    if (entry.slice(0, at).trim() !== name) continue
+    return `${name}=${entry.slice(at + 1).trim()}`
+  }
+  return undefined
+}
+
+/**
  * Whether the request already carries the Harness session cookie of the
  * current authority.
  *
@@ -320,6 +418,19 @@ export function isGuestPath(pathname) {
  * the `content-encoding` header untouched, and the phone's browser
  * decompresses it on its own.
  *
+ * **Brotli, not gzip.** The body that hurts most is the one that carries the
+ * client bundles of every installed plugin: several megabytes of minified
+ * JavaScript, concatenated. Gzip has a window of 32 KB, so it cannot see
+ * across the bundles, and minified code is already dense: the big bundle
+ * shrinks by 2.3× under gzip and by 3.1× under brotli. Brotli also has a
+ * window of up to 16 MB and compresses *faster* than gzip at the quality that
+ * matters here — the Host compresses on the request path, and the phone waits.
+ *
+ * Every browser that can run the Harness app understands `content-encoding:
+ * br`: the app needs ES modules, and every browser with ES modules has had
+ * brotli since 2016. The phone inflates it on its own, so nothing in the
+ * browser half has to know about it.
+ *
  * @param {number} status the upstream status
  * @param {Record<string, unknown>} headers the upstream response headers
  * @param {Buffer} body the upstream response body
@@ -333,6 +444,18 @@ async function compressResponse(status, headers, body) {
   if (typeof encoding === 'string' && encoding.length > 0) return { headers, body }
   const type = String(headers['content-type'] ?? '')
   if (!COMPRESSIBLE_CONTENT_TYPES.test(type)) return { headers, body }
+
+  const brotli = await compressBrotli(body)
+  if (brotli !== undefined && brotli.length < body.length) {
+    return {
+      headers: {
+        ...headers,
+        'content-encoding': 'br',
+        'content-length': String(brotli.length),
+      },
+      body: brotli,
+    }
+  }
 
   let compressed
   try {
@@ -350,6 +473,27 @@ async function compressResponse(status, headers, body) {
       'content-length': String(compressed.length),
     },
     body: compressed,
+  }
+}
+
+/**
+ * Compress a body with brotli.
+ *
+ * @param {Buffer} body the raw body
+ * @returns {Promise<Buffer | undefined>} undefined when brotli is not available
+ */
+async function compressBrotli(body) {
+  if (typeof brotliCompressAsync !== 'function') return undefined
+  try {
+    return await brotliCompressAsync(body, {
+      params: {
+        [BROTLI_PARAM_QUALITY]: BROTLI_QUALITY,
+        [BROTLI_PARAM_LGWIN]: BROTLI_WINDOW,
+        [BROTLI_PARAM_SIZE_HINT]: body.length,
+      },
+    })
+  } catch {
+    return undefined
   }
 }
 
@@ -388,6 +532,19 @@ export function rewritePhoneDocument(body, headers) {
     if (href === null || !href[1].startsWith('plugins/??')) return tag
     return tag.replace('rel="preload"', 'rel="modulepreload"').replace(/\s*as="script"/, '')
   })
+  // The inspector is a tool of the desktop: it lives on the machine the app
+  // runs on, and its address is a local one. A phone that is somewhere else
+  // cannot reach it, and a browser that tries asks the person for the
+  // permission to reach the local network — again and again, because the
+  // connection is retried for as long as the page lives.
+  //
+  // The announcement is therefore taken out of the phone's copy of the
+  // document. The inspector's client half reads it when it is there and does
+  // nothing when it is not.
+  rewritten = rewritten.replace(
+    /<script>\s*globalThis\["__DSH_INSPECTOR__"\][\s\S]*?<\/script>/gi,
+    '',
+  )
   const viewportMeta = /<meta\s+name="viewport"\s+content="([^"]*)"\s*\/?>/i
   if (viewportMeta.test(rewritten)) {
     rewritten = rewritten.replace(viewportMeta, (tag, content) => {
@@ -511,6 +668,21 @@ function removeQueryParam(query, name) {
     kept.push(part)
   }
   return kept.join('&')
+}
+
+/**
+ * Remove one query parameter from a URL, preserving every other one.
+ *
+ * @param {string} url the absolute URL
+ * @param {string} name the parameter to drop
+ * @returns {string}
+ */
+function removeQueryParamFromUrl(url, name) {
+  const at = url.indexOf('?')
+  if (at === -1) return url
+  const path = url.slice(0, at)
+  const query = removeQueryParam(url.slice(at + 1), name)
+  return query.length === 0 ? path : `${path}?${query}`
 }
 
 /**
@@ -648,6 +820,8 @@ export class RelayClient {
     this.localOrigin = local.origin
 
     this.pingIntervalMs = tuning.pingIntervalMs ?? DEFAULT_OPTIONS.pingIntervalMs
+    /** @type {number} how long an event stream may stay quiet. */
+    this.keepAliveMs = tuning.keepAliveMs ?? DEFAULT_OPTIONS.keepAliveMs
     this.reconnectBaseDelayMs = tuning.reconnectBaseDelayMs ?? DEFAULT_OPTIONS.reconnectBaseDelayMs
     this.reconnectMaxDelayMs = tuning.reconnectMaxDelayMs ?? DEFAULT_OPTIONS.reconnectMaxDelayMs
     this.handshakeTimeoutMs = tuning.handshakeTimeoutMs ?? DEFAULT_OPTIONS.handshakeTimeoutMs
@@ -689,6 +863,20 @@ export class RelayClient {
     this._bridges = new Map()
     /** @type {Map<string, NodeJS.Timeout>} */
     this._reconnectTimers = new Map()
+    /**
+     * The browser session of the local server, minted for the phone.
+     *
+     * The server hands the cookie out with the launch token, and answers with
+     * a redirect to the clean URL. The phone would have to follow that
+     * redirect over the link, and a browser that does not keep the cookie
+     * follows it again on every request. The cookie is therefore minted here,
+     * once, and carried into the phone's request.
+     *
+     * @type {string | undefined}
+     */
+    this._sessionCookie = undefined
+    /** @type {Promise<string | null>|undefined} */
+    this._sessionCookiePending = undefined
     /** @type {number} */
     this._managementAttempts = 0
     /** @type {number} */
@@ -1320,6 +1508,7 @@ export class RelayClient {
       !isGuest &&
       this.launchToken.length > 0 &&
       !hasQueryParam(query, 'token')
+    const bringsToken = hasQueryParam(query, 'token')
     const tokenInjected =
       canInject &&
       (options.forceToken === true || !hasSessionCookie(headers, this.localAuthority))
@@ -1330,7 +1519,7 @@ export class RelayClient {
     if (tokenInjected) search = appendQueryParam(search, 'token', this.launchToken)
     target.search = search ? `?${search}` : ''
 
-    return { url: target.href, pathname: relative, query: search, isDeviceRoot, isGuest, tokenInjected }
+    return { url: target.href, pathname: relative, query: search, isDeviceRoot, isGuest, tokenInjected, bringsToken }
   }
 
   /**
@@ -1372,7 +1561,7 @@ export class RelayClient {
     const headers = this._rewriteHeaders(frame.headers)
     const rawPath = typeof frame.path === 'string' ? frame.path : '/'
     const resolved = this._resolveUpstream(rawPath, frame.headers, { method })
-    const { url, pathname, query } = resolved
+    let { url, pathname, query } = resolved
 
     let body = null
     if (typeof frame.body === 'string' && frame.body.length > 0) {
@@ -1388,6 +1577,39 @@ export class RelayClient {
     // mismatching `content-length` from the phone can never stall it.
     delete headers['content-length']
     if (body && body.length > 0) headers['content-length'] = String(body.length)
+
+    // The phone's first request to the app root is answered with a cookie and
+    // a redirect: the server mints the session and sends the browser to the
+    // clean URL. Through a relay that redirect costs a whole extra round trip
+    // over the link — and a browser that does not keep the cookie pays it
+    // again on every request, which is a loop the phone never leaves.
+    //
+    // The Host mints the cookie for us instead: one local call, and the phone
+    // gets the app in a single hop.
+    //
+    // The session of the phone is the one the host holds. Whenever the phone
+    // does not carry a valid one — because its browser dropped it, or
+    // because the app moved its port — the host attaches the session it
+    // minted, so the phone is never refused for a cookie it cannot help.
+    //
+    // A guest never gets it: the launch token and the session are the
+    // owner's credential, and a guest that could trade them in would be the
+    // owner.
+    let mintedCookie = null
+    if (!resolved.isGuest && !resolved.bringsToken && !hasSessionCookie(headers, this.localAuthority)) {
+      const minted = await this._mintSessionCookie()
+      if (minted !== null) {
+        headers.cookie = appendCookie(headers.cookie, minted)
+        // The cookie is the session now: the token would only make the server
+        // mint another one and send the phone on another round trip.
+        if (resolved.tokenInjected === true) url = removeQueryParamFromUrl(url, 'token')
+        // The cookie has to reach the phone as well: the server would have
+        // sent it with its redirect, and there is no redirect any more. A
+        // phone without the cookie in its own jar is a phone whose every
+        // later request is refused.
+        mintedCookie = minted
+      }
+    }
 
     const controller = new AbortController()
     this._requests.set(id, { controller })
@@ -1414,6 +1636,10 @@ export class RelayClient {
             id,
             path: pathname,
           })
+          // The cookie the Host minted for us is worthless now: the app
+          // restarted and moved its port, or its secret changed. The next
+          // request mints a new one.
+          this._sessionCookie = undefined
           // The refused body is of no use: it is dropped, not read.
           opened.response.resume()
           opened = await this._openHttpRequest({
@@ -1442,6 +1668,11 @@ export class RelayClient {
         status: opened.status,
         headers: this._normalizeResponseHeaders(rewrittenHeaders, buffer.length),
         body: buffer,
+      }
+      if (mintedCookie !== null && response.headers['set-cookie'] === undefined) {
+        response.headers['set-cookie'] = [
+          `${mintedCookie}; Max-Age=${SESSION_COOKIE_MAX_AGE}; Path=/; HttpOnly; SameSite=Strict`,
+        ]
       }
       const compressed = await compressResponse(response.status, response.headers, response.body)
       if (compressed.body.length >= LARGE_BODY_STREAM_BYTES) {
@@ -1541,6 +1772,17 @@ export class RelayClient {
   }
 
   /**
+   * The browser session of the local server, minted for the phone.
+   *
+   * The launch token is the Host's own credential: the server hands out the
+   * session cookie for the current authority and answers with a redirect to
+   * the clean URL. The redirect is of no use to the phone — it would have to
+   * follow it over the link — so only the cookie is kept, and the phone's
+   * request carries it from then on.
+   *
+   * @returns {Promise<string | undefined>} the cookie as `name=value`
+   */
+  /**
    * Read the whole body of one upstream response.
    *
    * @param {import('node:http').IncomingMessage} response
@@ -1603,7 +1845,46 @@ export class RelayClient {
     }
 
     try {
-      for await (const chunk of opened.response) {
+      // The relay cuts a stream that stays quiet: its idle window is five
+      // minutes, and a phone that only reads the conversation sends nothing
+      // for a long time. The stream is therefore kept alive with a comment —
+      // the shape Server-Sent Events defines for exactly this — so the phone
+      // keeps its session, misses nothing, and does not have to fetch the
+      // conversation again after a cut.
+      //
+      // One read is outstanding at a time, and it is never dropped: a chunk
+      // that arrives while a keep-alive is being sent waits for its turn.
+      const iterator = opened.response[Symbol.asyncIterator]()
+      let pending = iterator.next()
+      for (;;) {
+        if (controller.signal.aborted) break
+        let timer = null
+        const keepAlive = new Promise((resolve) => {
+          timer = setTimeout(() => resolve({ kind: 'keepalive' }), this.keepAliveMs)
+          timer.unref?.()
+        })
+        const step = await Promise.race([
+          pending.then((value) => ({ kind: 'chunk', value })),
+          keepAlive,
+        ])
+        if (timer !== null) clearTimeout(timer)
+        if (step.kind === 'keepalive') {
+          // The keep-alive won the race: the chunk that is on its way keeps
+          // waiting.
+          if (controller.signal.aborted) break
+          this._sendTunnel(
+            responseChunkFrame({
+              id,
+              chunk: Buffer.from(STREAM_KEEPALIVE_COMMENT, 'utf8').toString('base64'),
+              last: false,
+            }),
+          )
+          continue
+        }
+        if (step.value.done) break
+        const chunk = Buffer.isBuffer(step.value.value)
+          ? step.value.value
+          : Buffer.from(String(step.value.value ?? ''), 'utf8')
         // An aborted request must not send another chunk.
         if (controller.signal.aborted) break
         // One frame never carries more than one bounded piece of the body.
@@ -1614,6 +1895,7 @@ export class RelayClient {
             responseChunkFrame({ id, chunk: piece.toString('base64'), last: false }),
           )
         }
+        pending = iterator.next()
       }
     } catch (err) {
       // A stream that dies must not leave the phone hanging: the last chunk
@@ -1687,6 +1969,9 @@ export class RelayClient {
     )
     const target = toWsUrl(url)
 
+    // The stream of the app is an owner peer: it needs the session of the
+    // phone. A session the server refuses is replaced by a fresh one when the
+    // bridge is retried — see `_retryUpgradeWithFreshCookie`.
     this._openLocalBridge(id, target, protocols, headers, upgrade, pathname, 0)
   }
 
@@ -1808,28 +2093,45 @@ export class RelayClient {
    */
   async _mintSessionCookie() {
     if (this.launchToken.length === 0) return null
-    const controller = new AbortController()
-    try {
-      const resolved = this._resolveUpstream('/', {}, { method: 'GET', forceToken: true })
-      const opened = await this._openHttpRequest({
-        method: 'GET',
-        url: resolved.url,
-        headers: { host: this.localAuthority, accept: '*/*' },
-        body: null,
-        controller,
-      })
-      opened.response.resume()
-      const raw = opened.rawHeaders['set-cookie']
-      const list = Array.isArray(raw) ? raw : raw === undefined ? [] : [raw]
-      for (const entry of list) {
-        const pair = String(entry).split(';')[0].trim()
-        if (pair.startsWith('dsh-auth-')) return pair
+    // The cookie is kept: the phone asks for the app root again and again,
+    // and one minting is enough for all of them. The session is refused when
+    // the app moves its port, and then the cookie is dropped and a new one is
+    // minted.
+    if (this._sessionCookie !== undefined) return this._sessionCookie
+    if (this._sessionCookiePending !== undefined) return this._sessionCookiePending
+    const pending = (async () => {
+      const controller = new AbortController()
+      try {
+        const resolved = this._resolveUpstream('/', {}, { method: 'GET', forceToken: true })
+        const opened = await this._openHttpRequest({
+          method: 'GET',
+          url: resolved.url,
+          headers: { host: this.localAuthority, accept: '*/*' },
+          body: null,
+          controller,
+        })
+        opened.response.resume()
+        const raw = opened.rawHeaders['set-cookie']
+        const list = Array.isArray(raw) ? raw : raw === undefined ? [] : [raw]
+        for (const entry of list) {
+          const pair = String(entry).split(';')[0].trim()
+          if (pair.startsWith('dsh-auth-')) {
+            this._sessionCookie = pair
+            return pair
+          }
+        }
+        this._log('the server minted no session cookie', { status: opened.status })
+        return null
+      } catch (err) {
+        this._log('failed to mint a session cookie', { error: err })
+        return null
       }
-      this._log('the server minted no session cookie', { status: opened.status })
-      return null
-    } catch (err) {
-      this._log('failed to mint a session cookie', { error: err })
-      return null
+    })()
+    this._sessionCookiePending = pending
+    try {
+      return await pending
+    } finally {
+      this._sessionCookiePending = undefined
     }
   }
 

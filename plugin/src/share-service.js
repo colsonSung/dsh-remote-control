@@ -329,7 +329,16 @@ export function createShareService(options = {}) {
   // The room of every share: the guests, the files they hold and the frames
   // they hear. The Host serves the event stream of every guest, so this is
   // already the one place where the guests of a share meet.
-  const rooms = options.rooms ?? createShareRooms()
+  //
+  // The owner of the share is not a guest of the room, but it has to see who
+  // is in it: the sinks of the owner wait for the changes of the room and
+  // carry them to the browser that holds the conversation.
+  /** @type {Map<string, Set<(line: string) => void>>} the owners that watch, by session */
+  const ownerSinks = new Map()
+  const rooms = options.rooms ?? createShareRooms({
+    onPresence: (shareId) => { publishOwnerPresence(shareId) },
+    now: options.now,
+  })
   /** @type {Map<string, NodeJS.Timeout>} the saves that wait for the guests to stop typing */
   const pendingSaves = new Map()
   /** @type {Map<string, { close: () => Promise<void> }>} the watchers of the files guests have open */
@@ -448,6 +457,133 @@ export function createShareService(options = {}) {
 
   /** @type {Map<string, { failures: number, firstFailureAt: number, lockedUntil: number }>} */
   const attempts = new Map()
+
+  /**
+   * The room of every share of one conversation, as the owner sees it.
+   *
+   * A conversation may be shared more than once, and every share has its own
+   * room: the view of the owner gathers them, so the owner sees everybody who
+   * is in the conversation and not only the ones of one link.
+   *
+   * @param {string} sessionId
+   * @returns {{ kind: 'presence', sessionId: string, guests: any[], locks: any[] }}
+   */
+  function ownerRoom(sessionId) {
+    const guests = []
+    const locks = []
+    for (const share of listShares()) {
+      if (share.sessionId !== sessionId) continue
+      if (share.revokedAt !== null && share.revokedAt !== undefined) continue
+      const view = rooms.view(share.id)
+      for (const guest of view.guests) guests.push({ ...guest, shareId: share.id })
+      for (const lock of view.locks) locks.push({ ...lock, shareId: share.id })
+    }
+    return { kind: 'presence', sessionId, guests, locks }
+  }
+
+  /**
+   * Tell the owner of a conversation who is in its room.
+   *
+   * @param {string} shareId
+   */
+  function publishOwnerPresence(shareId) {
+    const share = getShare(shareId)
+    if (share === undefined) return
+    publishOwnerRoom(share.sessionId)
+  }
+
+  /**
+   * Tell the owner of a conversation who is in its room.
+   *
+   * @param {string} sessionId
+   */
+  function publishOwnerRoom(sessionId) {
+    const sinks = ownerSinks.get(sessionId)
+    if (sinks === undefined || sinks.size === 0) return
+    const line = `data: ${JSON.stringify(ownerRoom(sessionId))}\n\n`
+    for (const sink of sinks) {
+      try {
+        sink(line)
+      } catch (error) {
+        // The owner that went away takes its sink with it; the others carry on.
+      }
+    }
+  }
+
+  /**
+   * The live room of one conversation, as a stream of frames.
+   *
+   * The owner of a conversation does not poll for it: the stream carries every
+   * change of the room, so the browser that holds the conversation knows who
+   * is in it and who is writing, without asking.
+   *
+   * @param {string} sessionId
+   * @param {AbortSignal} [signal] the signal of the request: the stream ends
+   *   with it
+   * @returns {ReadableStream<Uint8Array>}
+   */
+  function presenceStream(sessionId, signal) {
+    const encoder = new TextEncoder()
+    let closed = false
+    let heartbeat = null
+    let unsubscribe = () => {}
+    let stream = null
+    const close = () => {
+      if (closed) return
+      closed = true
+      if (heartbeat !== null) clearInterval(heartbeat)
+      heartbeat = null
+      unsubscribe()
+      if (stream === null) return
+      try {
+        stream.close()
+      } catch (error) {
+        // The stream is already closed.
+      }
+    }
+    return new ReadableStream({
+      start(controller) {
+        stream = controller
+        const sink = (line) => {
+          if (closed) return
+          try {
+            controller.enqueue(encoder.encode(line))
+          } catch (error) {
+            // The browser that went away is not waiting for the frame.
+          }
+        }
+        let sinks = ownerSinks.get(sessionId)
+        if (sinks === undefined) {
+          sinks = new Set()
+          ownerSinks.set(sessionId, sinks)
+        }
+        sinks.add(sink)
+        unsubscribe = () => {
+          sinks.delete(sink)
+          if (sinks.size === 0) ownerSinks.delete(sessionId)
+        }
+        // The owner sees the room as it is, and every change of it after.
+        sink(`data: ${JSON.stringify(ownerRoom(sessionId))}\n\n`)
+        // A stream that says nothing for a while is cut by the proxies between
+        // the browser and the Host, so the stream says that it is alive.
+        heartbeat = setInterval(() => {
+          if (closed) return
+          try {
+            controller.enqueue(encoder.encode(': keep-alive\n\n'))
+          } catch (error) {
+            close()
+          }
+        }, 20_000)
+        if (signal !== undefined) {
+          if (signal.aborted) close()
+          else signal.addEventListener('abort', close, { once: true })
+        }
+      },
+      cancel() {
+        close()
+      },
+    })
+  }
 
   /**
    * Is this caller locked out?
@@ -754,7 +890,36 @@ export function createShareService(options = {}) {
      */
     remove(id) {
       queues.drop(id)
-      return deleteShare(id)
+      const share = getShare(id)
+      const removed = deleteShare(id)
+      if (removed && share !== undefined) {
+        // The room of a share that is gone is gone with it, and the owner of
+        // the conversation must not keep seeing the guests of a dead link.
+        rooms.drop(id)
+        publishOwnerRoom(share.sessionId)
+      }
+      return removed
+    },
+
+    /**
+     * The room of a conversation, as the owner sees it.
+     *
+     * @param {string} sessionId
+     * @returns {{ kind: 'presence', sessionId: string, guests: any[], locks: any[] }}
+     */
+    ownerRoom(sessionId) {
+      return ownerRoom(sessionId)
+    },
+
+    /**
+     * The live room of a conversation, as a stream of frames.
+     *
+     * @param {string} sessionId
+     * @param {AbortSignal} [signal]
+     * @returns {ReadableStream<Uint8Array>}
+     */
+    presenceStream(sessionId, signal) {
+      return presenceStream(sessionId, signal)
     },
 
     /**
@@ -970,11 +1135,15 @@ export function createShareService(options = {}) {
               } else {
                 rooms.unlock(share.id, guestId, path)
               }
+            } else if (action2 === 'typing') {
+              // A guest says that it is writing, or that it stopped. The owner
+              // of the conversation sees it, and so does every other guest.
+              rooms.setTyping(share.id, guestId, body?.typing === true)
             } else {
               rooms.update(share.id, guestId, { name: body?.name })
             }
             const view = rooms.view(share.id)
-            rooms.broadcast(share.id, { kind: 'presence', ...view })
+            rooms.announce(share.id)
             sendJson(res, 200, { ok: true, ...view })
             return
           }
@@ -1438,16 +1607,16 @@ export function createShareService(options = {}) {
         rooms.broadcast(share.id, { kind: 'collab-saved', path, version: entry.baseVersion, length: text.length })
       } catch (error) {
         log('share: the document could not be written', { path, error: String(error) })
-        // The file moved on: the document starts again from the file, and the
-        // guests are told that what they had is gone.
-        let current = ''
-        try {
-          current = await fs.readText(resolved.target, undefined)
-        } catch (readError) {
-          current = ''
-        }
-        collab.reset(entry, current)
-        rooms.broadcast(share.id, { kind: 'collab-reset', path, reason: 'the file was rewritten' })
+        // The file moved on. What the guest wrote is not thrown away: the
+        // document keeps it, the guests are told that it did not reach the
+        // file, and the text reaches the file when the guest says so.
+        entry.blocked = true
+        rooms.broadcast(share.id, {
+          kind: 'collab-save-failed',
+          path,
+          version: current,
+          reason: 'the file changed while you were editing it',
+        })
       }
     },
 
@@ -1662,7 +1831,10 @@ export function createShareService(options = {}) {
           update: String(body?.update ?? ''),
           from: Number(body?.client ?? 0),
         })
-        this.scheduleSave(share, path)
+        // A document whose write was refused waits for the guest: saving it
+        // again would fail again, and the guest is the one who has to say
+        // what the file should hold.
+        if (entry.blocked !== true) this.scheduleSave(share, path)
         sendJson(res, 200, { ok: true })
         return
       }
@@ -1777,6 +1949,13 @@ export function createShareService(options = {}) {
           undefined,
           { mode: 'workspace-write', workspaceRoot: root, sessionId: share.sessionId },
         )
+        // A document that is open in an editor takes the new version as its
+        // base: the guest has just said what the file should hold.
+        const open = collab.find(share.id, candidate)
+        if (open !== undefined) {
+          open.baseVersion = outcome?.version ?? current.version
+          open.blocked = false
+        }
         rooms.broadcast(share.id, { kind: 'file', path: candidate, version: outcome?.version ?? current.version, changedBy: 'guest' })
         sendJson(res, 200, { ok: true, version: outcome?.version ?? current.version })
       } catch (error) {
