@@ -127,7 +127,9 @@ class FakeHost {
           platform: 'darwin',
           clientVersion: '1.2.3',
           localBaseUrl: this.options.localBaseUrl,
-          accessKey: 'access-key',
+          // An empty key is the relay's "the link is the credential" mode, which
+          // lets a test read the app's own paths without unlocking first.
+          accessKey: this.options.accessKey ?? 'access-key',
           passcode: this.options.passcode ?? '12345678',
           shares: this.options.shares ?? [],
         }),
@@ -249,7 +251,7 @@ class FakeHost {
  * Boot a relay for one test.
  *
  * @param {(options: any) => any} create
- * @param {{statePath?: string, log?: (message: string) => void}} [options]
+ * @param {{statePath?: string, log?: (message: string) => void, relayOptions?: Record<string, number>}} [options]
  */
 async function startRelay(create, options = {}) {
   const relay = create({
@@ -257,6 +259,7 @@ async function startRelay(create, options = {}) {
     publicBaseUrl: 'http://127.0.0.1:0',
     statePath: options.statePath,
     log: options.log ?? (() => {}),
+    ...(options.relayOptions ?? {}),
   })
   const { port } = await relay.listen({ host: '127.0.0.1', port: 0 })
   return { relay, url: `http://127.0.0.1:${port}` }
@@ -265,22 +268,29 @@ async function startRelay(create, options = {}) {
 /**
  * Start the fake upstream server the host serves.
  *
+ * @param {{delayMs?: number}} [options] delayMs makes the host answer late, so
+ * the relay's request deadlines can be measured.
  * @returns {Promise<{url: string, close: () => Promise<void>}>}
  */
-async function startUpstream() {
+async function startUpstream(options = {}) {
+  const delayMs = Number(options.delayMs ?? 0)
   const server = http.createServer((req, res) => {
     const chunks = []
     req.on('data', (chunk) => chunks.push(chunk))
     req.on('end', () => {
-      res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(
-        JSON.stringify({
-          method: req.method,
-          url: req.url,
-          headers: req.headers,
-          body: Buffer.concat(chunks).toString('utf8'),
-        }),
-      )
+      const answer = () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }),
+        )
+      }
+      if (delayMs > 0) setTimeout(answer, delayMs)
+      else answer()
     })
   })
   server.listen(0, '127.0.0.1')
@@ -694,5 +704,36 @@ for (const implementation of IMPLEMENTATIONS) {
     assert.equal(response.status, 200)
     assert.equal(host.requests.length, 1)
     assert.equal(host.requests[0].path, '/?rc=1&k=access-key')
+  })
+
+  test(`${implementation.name}: the app's own data outlives the deadline of a file`, async (t) => {
+    // The host answers after 250 ms: far past the ordinary deadline, well
+    // inside the long one. That single delay measures both.
+    const upstream = await startUpstream({ delayMs: 250 })
+    const { relay, url } = await startRelay(implementation.create, {
+      relayOptions: { requestTimeoutMs: 80, longRequestTimeoutMs: 600 },
+    })
+    // No access key: the link is the credential, so no unlock is in the way.
+    const host = await new FakeHost({
+      relayUrl: url,
+      localBaseUrl: upstream.url,
+      accessKey: '',
+    }).connect()
+    t.after(async () => {
+      await host.close()
+      await relay.close()
+      await upstream.close()
+    })
+
+    // A static file is a moment's work: the phone must not hang on it.
+    const file = await request(`${url}/assets/index.js`)
+    assert.equal(file.status, 504, 'a file that is 4x the deadline late is given up on')
+    assert.match(file.body, /did not answer/)
+
+    // The app's own data is work, not a file: the session list of a busy
+    // machine is megabytes of JSON and the host needs the time to build it.
+    const data = await request(`${url}/api/session/list`)
+    assert.equal(data.status, 200, 'the app data outlives the ordinary deadline')
+    assert.match(data.body, /"url":"\/api\/session\/list"/)
   })
 }

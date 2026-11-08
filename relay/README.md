@@ -170,8 +170,19 @@ A request that answers with a body that never ends — an event stream — is
 forwarded to the phone **chunk by chunk**: the head goes out first, every
 chunk follows as it arrives, and the phone sees them live. The relay keeps
 such a request alive with an idle window of five minutes, because an event
-stream says nothing between its events; a request that has not been answered
-at all still has to answer within thirty seconds.
+stream says nothing between its events.
+
+A request that has not been answered at all gets a deadline of its own, and
+the deadline follows the work:
+
+| Request | Deadline | Why |
+|---|---|---|
+| `/api/directoryPicker/pick` | 300 s | it waits for a person at the desktop to pick a folder |
+| `/api/**`, `/share/**` | 120 s | the app's own data — a session list of a busy machine is megabytes of JSON, and the host needs the time to build it |
+| anything else (assets, the app shell) | 30 s | files, answered in a moment; a phone must not hang on them |
+
+A request that misses its deadline is answered `504 host did not answer in
+time`.
 
 A relay also tells the Harness what it can do when the device registers. The
 `binary_body` capability lets the host send the body of a response as one
