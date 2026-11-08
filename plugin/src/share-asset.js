@@ -60,7 +60,7 @@ const LIBRARY = join('node_modules', 'mermaid', 'dist', 'mermaid.min.js')
 export function mermaidCandidates() {
   const candidates = [
     // The sibling plugin of this workspace keeps the library.
-    join(WORKSPACE_ROOT, 'markdown-mermaid-preview', LIBRARY),
+    join(WORKSPACE_ROOT, 'workspace-file-preview', LIBRARY),
     // A workspace-wide install.
     join(WORKSPACE_ROOT, LIBRARY),
     // An install right beside this plugin.
