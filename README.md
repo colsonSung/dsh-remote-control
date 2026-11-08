@@ -5,6 +5,12 @@ Harness**: the same sessions, the same streaming output, the same tool
 approvals, the same composer. The phone loads the app itself, so there is no
 second, stripped-down mobile UI to build, and none to keep in step.
 
+[![Watch the demo: one conversation, two people](docs/demo.png)](https://github.com/colsonSung/dsh-remote-control/releases/download/v1.5.5/remote-control-demo.mp4)
+
+**Watch the demo** — a shared conversation with a guest on a phone: the link and
+the passcode, the guest joining, the owner seeing who is in the room and who is
+typing, and one agent answering for both.
+
 > 中文说明：手机 / iPad 扫码打开，就是电脑上那套**完整的 DeepSeek Harness**——会话
 > 列表、流式输出、工具审批、输入框全部原样可用，不需要维护第二套手机界面。手机上
 > 侧栏占满整屏、用完自动收起、一次点击即打开会话；电脑**不开任何入站端口**，主机
