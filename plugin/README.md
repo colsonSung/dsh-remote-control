@@ -531,6 +531,8 @@ Settings navigation next to *General*, *Models*, *Plugins* and *Agent presets*.
 | `src/device-store.js` | Durable device identity and the shared secret |
 | `src/share-store.js` | Durable share records: the session, the permission, the passcode and the project root |
 | `src/share-service.js` | The guest surface: the routes, the passcode, the cookie, the project boundary, the room of the owner |
+| `src/share-media.js` | The media type, download name and byte range of a file the guest takes as bytes |
+| `src/share-files.js` | The kind of a file and its glyph: what the panel opens, and how it looks in the tree |
 | `src/share-room.js` | The room of a share: the guests, the locks, and who is writing |
 | `src/share-identity.js` | The name and the colour of a guest — the same in every place it is shown |
 | `tools/sync-contract.js` | Writes the wire contract into the browser half and checks it |
@@ -650,8 +652,9 @@ never reaches them.
 | `GET /share/<id>/api/tree?path=` | Lists one directory of the project root |
 | `GET /share/<id>/api/trajectory` | The steps of the conversation, as the host's Trajectory tab shows them |
 | `GET /share/<id>/api/context` | The files the conversation produced |
-| `GET /share/<id>/api/file?path=` | Reads one file inside the project root |
-| `GET /share/<id>/api/blob?path=` | Reads one image of the project as bytes |
+| `GET /share/<id>/api/file?path=` | Reads one text file inside the project root |
+| `GET /share/<id>/api/blob?path=` | Reads one file of the project as bytes, with a byte range and a download name |
+| `GET /share/<id>/api/office?path=` | Renders one Office document into a PDF for the panel |
 | `GET /share/<id>/api/asset?name=mermaid` | The mermaid library, for the documents that carry a diagram |
 | `GET /share/<id>/api/room` | Who is in the room, and what each of them holds |
 | `POST /share/<id>/api/room` | A guest says who it is, what it has open, whether it holds it, whether it is writing |
@@ -780,6 +783,57 @@ The files the guest reads are coloured, by the language their extension names:
 without a closure — the page injects its own source into the browser and the
 tests run it here. It escapes the text before it colours it, so a file can
 never write markup into the page.
+
+### What the guest can open
+
+A project is not only Markdown. The panel opens the file the guest clicked,
+and what it does with the file depends on what the file is:
+
+| The file | The panel |
+| --- | --- |
+| Markdown, HTML, source, data, text | read by the Host as text, coloured by the language its extension names |
+| A picture | the bytes, drawn in place |
+| A PDF | the bytes, handed to the viewer of the browser |
+| A recording (mp4, mov, webm, mp3, wav…) | the bytes, played by the browser |
+| DOC, DOCX, XLS, XLSX, PPT, PPTX | rendered by the Host into a PDF, then shown like a PDF |
+| Anything else (zip, fonts, other Office formats) | a download, with the reason written in the panel |
+
+**An Office document is rendered, not read.** The browser cannot paint a
+workbook, and the Host can: `ctx.get('officeKit')` turns the document into a
+PDF in the memory of the process and hands the bytes to the page. Nothing is
+written back into the project, the source stays the file it is, and the kit
+caches the result by the content of the file, so the second guest of the same
+document waits for nothing.
+
+The guest is told when that cannot happen, and the reason is not one message
+for three situations:
+
+- the Host has no Office kit (**503 `preview-unavailable`**) — a capability
+  the Host does not have is a state, not a broken panel;
+- the Host is rendering other documents and the queue is full
+  (**503 `preview-busy`**) — the guest is told to try again in a moment;
+- the document itself cannot be rendered (**422 `preview-failed`**).
+
+In every one of them the file stays downloadable: the panel offers the
+download and hides the tab of an "Open" that would only download it without
+saying so.
+
+The bytes of a file travel through `GET /share/<id>/api/blob?path=`, with a
+**byte range**: a PDF viewer asks for the window it is about to show, and a
+phone that seeks in a recording asks for the middle of it, so the route answers
+`206` with a `content-range` instead of reading a file it does not have to. A
+window past the end answers `416` with the length of the file. The bytes of a
+share are capped at 64 MiB: they pass through this process and over the
+tunnel, and a file above it is told so rather than held in memory.
+
+Every file can be **downloaded** (`download=1`): the answer is an
+`attachment` under the name the file really has — a Chinese name survives the
+save through the encoded half of the `Content-Disposition`, while the plain
+half keeps the name readable for an old client.
+
+An SVG travels with a `Content-Security-Policy` of its own: served from the
+share's origin, a script inside it could speak to the share with the guest's
+cookie, so the browser runs nothing in it.
 
 The guest cookie is `dsh-share-<id>`, and its value is
 `<issuedAt>.<HMAC-SHA256(device secret, "share:<id>:<issuedAt>")>` in base64url.

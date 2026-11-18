@@ -231,7 +231,16 @@ function runGuestPage(options = {}) {
     const answer = target.endsWith('api/message')
       ? { ok: true, queued: true, id: 'q0a1b2c3', position: 1 }
       : target.endsWith('api/tree')
-        ? { ok: true, path: '', entries: [{ name: 'note.md', path: 'note.md', kind: 'file', size: 12 }] }
+        ? {
+            ok: true,
+            path: '',
+            entries: [
+              { name: 'note.md', path: 'note.md', kind: 'file', size: 12 },
+              { name: 'plan.pdf', path: 'plan.pdf', kind: 'file', size: 300 },
+              { name: 'clip.mp4', path: 'clip.mp4', kind: 'file', size: 400 },
+              { name: 'archive.zip', path: 'archive.zip', kind: 'file', size: 500 },
+            ],
+          }
         : {}
     const text = target.includes('api/file?path=') ? 'the text of the file' : ''
     return Promise.resolve({
@@ -674,3 +683,33 @@ test('the page does not show the guest itself in the room', () => {
   const box = page.document.getElementById('presence')
   assert.equal(box.hidden, true, 'a guest does not see itself in the room')
 })
+
+test('the page carries the tools of a file and the reader of a document', () => {
+  const html = pageHtml()
+  // A document opens in a tab of its own, and every file can be saved.
+  assert.match(html, /id="fileOpen"/, 'the panel offers to open the document in a tab')
+  assert.match(html, /id="fileDownload"/, 'the panel offers the file itself')
+  // An Office document is rendered by the Host, not read as text.
+  assert.match(html, /api\/office\?path=/, 'the page asks the Host for the rendered document')
+  assert.match(html, /Rendering this document/, 'the panel says that the document is being rendered')
+  assert.match(html, /\.file-spinner\s*\{/, 'the panel shows that it is working')
+  assert.match(html, /@keyframes file-spin/, 'the work has a motion of its own')
+  assert.match(html, /prefers-reduced-motion: reduce[^}]*\.file-spinner/, 'the motion can be still')
+})
+
+test('a file the page cannot show is a file the guest can take', async () => {
+  const page = runGuestPage()
+  // The page cannot read these bytes in the test, so the panel has to say so
+  // and hand the guest the download: a panel that stays blank is a lost file.
+  await page.openFile('plan.pdf')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const card = page.document.querySelector('.file-unavailable')
+  assert.ok(card !== null, 'the panel says what happened')
+  const link = page.document.querySelector('.file-download')
+  assert.ok(link !== null, 'the panel offers the download')
+  assert.match(link.getAttribute('href'), /api\/blob\?path=plan\.pdf&download=1/)
+  const header = page.document.getElementById('fileDownload')
+  assert.equal(header.hidden, false, 'the header offers the file too')
+  assert.match(header.getAttribute('href'), /download=1/)
+})
+

@@ -24,8 +24,26 @@ test('the kind of a file follows its extension', () => {
   assert.equal(fileKindOf('archive.zip'), 'binary')
 })
 
+test('the document kinds follow what the browser and the Host can show', () => {
+  // The browser reads a PDF itself, and the Host renders the six Office
+  // formats it can convert: the page treats the two differently.
+  assert.equal(fileKindOf('报告.pdf'), 'pdf')
+  assert.equal(fileKindOf('book.xlsx'), 'office')
+  assert.equal(fileKindOf('notes.docx'), 'office')
+  assert.equal(fileKindOf('deck.pptx'), 'office')
+  assert.equal(fileKindOf('old.doc'), 'office')
+  assert.equal(fileKindOf('old.xls'), 'office')
+  assert.equal(fileKindOf('old.ppt'), 'office')
+  // A format the kit does not convert stays a download.
+  assert.equal(fileKindOf('letter.odt'), 'binary')
+  assert.equal(fileKindOf('clip.mp4'), 'video')
+  assert.equal(fileKindOf('clip.mov'), 'video')
+  assert.equal(fileKindOf('voice.mp3'), 'audio')
+  assert.equal(fileKindOf('voice.m4a'), 'audio')
+})
+
 test('the glyph of an entry is an svg', () => {
-  for (const kind of ['directory', 'markdown', 'html', 'image', 'data', 'code', 'text', 'binary']) {
+  for (const kind of ['directory', 'markdown', 'html', 'image', 'pdf', 'office', 'video', 'audio', 'data', 'code', 'text', 'binary']) {
     const svg = fileIconSvg(kind)
     assert.match(svg, /^<svg /, `the ${kind} glyph is an svg`)
     assert.match(svg, /<\/svg>$/, `the ${kind} glyph is closed`)

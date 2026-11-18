@@ -10,7 +10,8 @@
  * The kind of one file, by its extension.
  *
  * @param {string} path
- * @returns {string} one of markdown, html, image, code, data, text, binary
+ * @returns {string} one of markdown, html, image, pdf, office, video, audio,
+ *   code, data, text, binary
  */
 export function fileKindOf(path) {
   const name = String(path ?? '').split('/').pop() ?? ''
@@ -21,10 +22,18 @@ export function fileKindOf(path) {
   if (extension === 'html' || extension === 'htm' || extension === 'xhtml') return 'html'
   if (extension === 'svg') return 'image'
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'bmp'].includes(extension)) return 'image'
+  // A PDF is the one document the browser reads itself: the page hands it to
+  // the viewer of the browser instead of reading it as text.
+  if (extension === 'pdf') return 'pdf'
+  // The Office documents the Host can turn into a PDF for the guest: the kit
+  // converts exactly these six, so every other Office format stays a download.
+  if (['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'].includes(extension)) return 'office'
+  if (['mp4', 'm4v', 'webm', 'mov', 'ogv'].includes(extension)) return 'video'
+  if (['mp3', 'm4a', 'wav', 'ogg', 'oga', 'flac', 'aac', 'aiff'].includes(extension)) return 'audio'
   if (['json', 'jsonc', 'yml', 'yaml', 'toml', 'ini', 'lock'].includes(extension)) return 'data'
   if (['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'mts', 'cts', 'py', 'rb', 'sh', 'bash', 'zsh', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'h', 'cc', 'cpp', 'hpp', 'cs', 'php', 'scala', 'dart', 'sql', 'lua', 'r', 'pl', 'vim', 'el'].includes(extension)) return 'code'
   if (['txt', 'log', 'text', 'csv', 'tsv', 'env', 'gitignore', 'editorconfig'].includes(extension)) return 'text'
-  if (['pdf', 'zip', 'gz', 'tar', 'tgz', '7z', 'rar', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp3', 'mp4', 'mov', 'wasm', 'bin', 'dylib', 'so', 'dll', 'exe', 'jar', 'class', 'pyc'].includes(extension)) return 'binary'
+  if (['zip', 'gz', 'tar', 'tgz', '7z', 'rar', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'wasm', 'bin', 'dylib', 'so', 'dll', 'exe', 'jar', 'class', 'pyc', 'odt', 'ods', 'odp', 'rtf', 'docm', 'xlsm', 'pptm', 'epub'].includes(extension)) return 'binary'
   return 'text'
 }
 
@@ -52,6 +61,22 @@ export function fileIconSvg(kind, options = {}) {
   }
   if (kind === 'image') {
     return box('<rect x="2.2" y="3" width="11.6" height="10" rx="1.2" stroke="' + stroke + '" stroke-width="1.1"/><circle cx="6" cy="6.4" r="1.1" fill="' + stroke + '" fill-opacity=".55"/><path d="m2.8 11.4 3-2.8 2.2 2 1.8-1.6 3.2 2.8" stroke="' + stroke + '" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>')
+  }
+  if (kind === 'pdf') {
+    // A page with its corner folded: the shape of a document the browser
+    // shows, not the shape of a file the guest downloads.
+    return box('<path d="M4 2.4h5.2L12.6 5.8v7.8H4z" stroke="' + stroke + '" stroke-width="1.1" stroke-linejoin="round"/><path d="M9.2 2.6v3.2h3.2" stroke="' + stroke + '" stroke-width="1.1" stroke-linejoin="round"/><path d="M6.2 11.4V8.6h1.1a1 1 0 0 1 0 2H6.2" stroke="' + stroke + '" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>')
+  }
+  if (kind === 'office') {
+    // A page that carries a table: the spreadsheet and the document are read
+    // the same way here, as a document the Host renders.
+    return box('<path d="M3.2 2.6h9.6v10.8H3.2z" stroke="' + stroke + '" stroke-width="1.1" stroke-linejoin="round"/><path d="M3.4 6.4h9.2M6.6 6.4v7M3.4 9.6h9.2" stroke="' + stroke + '" stroke-width="1" stroke-linecap="round"/>')
+  }
+  if (kind === 'video') {
+    return box('<rect x="2.2" y="3.4" width="11.6" height="9.2" rx="1.4" stroke="' + stroke + '" stroke-width="1.1"/><path d="M7 6.2 10 8l-3 1.8V6.2Z" fill="' + stroke + '" fill-opacity=".5" stroke="' + stroke + '" stroke-width="1" stroke-linejoin="round"/>')
+  }
+  if (kind === 'audio') {
+    return box('<rect x="2.4" y="3.4" width="11.2" height="9.2" rx="1.4" stroke="' + stroke + '" stroke-width="1.1"/><path d="M5.4 9.6V6.6M7.6 11V5M9.8 9.8V6.4M12 8.6V7.8" stroke="' + stroke + '" stroke-width="1.1" stroke-linecap="round"/>')
   }
   if (kind === 'data') {
     return box('<rect x="2.4" y="3.2" width="11.2" height="9.6" rx="1.2" stroke="' + stroke + '" stroke-width="1.1"/><path d="M5.4 6.2h5.2M5.4 8.2h5.2M5.4 10.2h3" stroke="' + stroke + '" stroke-width="1.1" stroke-linecap="round"/>')

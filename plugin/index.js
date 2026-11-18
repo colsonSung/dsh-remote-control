@@ -51,7 +51,7 @@ export const name = 'remote-control'
 export const ROUTE = '/api/remote-control'
 
 /** The version this plugin reports to a relay. */
-export const CLIENT_VERSION = '1.4.0'
+export const CLIENT_VERSION = '1.6.0'
 
 /** The product name a relay shows for this client. */
 export const CLIENT_NAME = 'dsh-desktop'
@@ -385,20 +385,61 @@ export function apply(ctx) {
   }
 
   /**
+   * Every client this plugin ever started.
+   *
+   * A start that runs while an earlier one is still up must not leave the older
+   * client behind: two clients with the same device id fight over the relay's
+   * registration, the relay keeps only one of them, and the loser keeps
+   * opening tunnels that steal the traffic from the winner.
+   *
+   * @type {Set<any>}
+   */
+  const clients = new Set()
+
+  /**
+   * The tunnel work runs one task at a time.
+   *
+   * The settings page, the file watcher and the plugin's own start all reach
+   * for the tunnel; two of them at once would open two tunnels.
+   *
+   * @type {Promise<unknown>}
+   */
+  let tunnelWork = Promise.resolve()
+
+  /**
+   * Run one tunnel task after the one before it.
+   *
+   * @template T
+   * @param {() => Promise<T>} task
+   * @returns {Promise<T>}
+   */
+  function queueTunnelWork(task) {
+    const run = tunnelWork.then(task, task)
+    tunnelWork = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    return run
+  }
+
+  /**
    * Stop the tunnel and the bundled relay.
    */
   async function stop() {
-    if (state.client !== undefined) {
-      await state.client.stop().catch(() => {})
+    await queueTunnelWork(async () => {
+      for (const client of clients) {
+        await client.stop().catch(() => {})
+      }
+      clients.clear()
       state.client = undefined
-    }
-    if (state.relay !== undefined) {
-      await state.relay.close().catch(() => {})
-      state.relay = undefined
-    }
-    bundledBaseUrl = ''
-    state.publicUrl = undefined
-    state.enabled = false
+      if (state.relay !== undefined) {
+        await state.relay.close().catch(() => {})
+        state.relay = undefined
+      }
+      bundledBaseUrl = ''
+      state.publicUrl = undefined
+      state.enabled = false
+    })
   }
 
   /**
@@ -412,9 +453,27 @@ export function apply(ctx) {
 
   /**
    * Start the relay and the tunnel.
+   *
+   * The work is queued: the settings page, the file watcher and the plugin's
+   * own start all reach for the tunnel, and two starts at once would leave a
+   * client behind that fights the new one for the relay's registration.
+   *
    * @returns {Promise<void>}
    */
   async function start() {
+    return queueTunnelWork(startTunnel)
+  }
+
+  /**
+   * Start the tunnel, after every older client has been let go.
+   * @returns {Promise<void>}
+   */
+  async function startTunnel() {
+    for (const client of clients) {
+      await client.stop().catch(() => {})
+    }
+    clients.clear()
+    state.client = undefined
     const base = localBaseUrl()
     if (base === undefined) throw new Error('remote-control: this host serves no web interface yet')
     const token = launchToken(base)
@@ -466,6 +525,7 @@ export function apply(ctx) {
       passcode,
       log: (message) => log(message),
     })
+    clients.add(client)
     state.client = client
     // The registration carries the shared sessions, so a relay that restarted
     // learns the guest links again.

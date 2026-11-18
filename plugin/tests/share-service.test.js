@@ -487,7 +487,7 @@ async function startGuestServer(service) {
 /**
  * One share, a service and a running guest server.
  *
- * @param {{ permission?: 'read'|'write', now?: () => number, mermaidPath?: string | (() => string | undefined), live?: boolean, busy?: boolean }} [options]
+ * @param {{ permission?: 'read'|'write', now?: () => number, mermaidPath?: string | (() => string | undefined), live?: boolean, busy?: boolean, officeKit?: any }} [options]
  * @returns {Promise<any>}
  */
 async function setup(options = {}) {
@@ -508,6 +508,7 @@ async function setup(options = {}) {
     fs: makeFs(project.root),
     now: options.now,
     mermaidPath: options.mermaidPath,
+    officeKit: options.officeKit,
   })
   const record = store.createShare({
     sessionId: 'session-1',
@@ -1111,19 +1112,210 @@ test('the tree and the projections need the passcode', async () => {
   await server.close()
 })
 
-test('a guest sees an image of the project as bytes', async () => {
+test('a guest reads any file of the project as bytes', async () => {
   const fixture = await setup()
   const { origin, record, server, project } = fixture
   const cookie = await unlock(fixture)
 
-  // A file that is not an image travels as text, not as bytes.
+  // The pages and the recordings a project holds are not text: the guest gets
+  // the bytes themselves, with the type the browser needs to show them.
+  const pdf = Buffer.from('%PDF-1.4\n' + 'x'.repeat(120), 'utf8')
+  writeFileSync(join(project.root, '计划表.pdf'), pdf)
+  const book = Buffer.from('PK\u0003\u0004 a workbook', 'utf8')
+  writeFileSync(join(project.root, 'book.xlsx'), book)
+
+  const read = await request(`${origin}/share/${record.id}/api/blob?path=${encodeURIComponent('计划表.pdf')}`, { headers: { cookie } })
+  assert.equal(read.status, 200, 'the document travels as bytes')
+  assert.equal(read.headers['content-type'], 'application/pdf')
+  assert.equal(read.headers['accept-ranges'], 'bytes', 'the viewer may ask for a window')
+  assert.equal(read.headers['x-content-type-options'], 'nosniff')
+  assert.match(read.headers['content-disposition'], /^inline;/, 'a PDF is shown in place')
+  // The Chinese name survives the save: the plain form is no way to carry it,
+  // so the encoded form carries the real one.
+  assert.match(read.headers['content-disposition'], /filename\*=UTF-8''%E8%AE%A1%E5%88%92%E8%A1%A8\.pdf/)
+  assert.equal(read.body, pdf.toString('utf8'))
+
+  // A text file still travels as bytes here — the page reads it through the
+  // text route, and a download of it is a download of the file.
   const text = await request(`${origin}/share/${record.id}/api/blob?path=inside.txt`, { headers: { cookie } })
-  assert.equal(text.status, 415, 'a text file is not an image')
+  assert.equal(text.status, 200)
+  assert.match(text.headers['content-type'], /^text\/plain/)
+
+  // An Office document is served as the file it is, and saved when asked for.
+  const office = await request(`${origin}/share/${record.id}/api/blob?path=book.xlsx`, { headers: { cookie } })
+  assert.equal(office.status, 200)
+  assert.equal(office.headers['content-type'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+  assert.match(office.headers['content-disposition'], /^attachment;/, 'the browser cannot paint a workbook')
+
+  // A save says it is a save.
+  const save = await request(`${origin}/share/${record.id}/api/blob?path=book.xlsx&download=1`, { headers: { cookie } })
+  assert.equal(save.status, 200)
+  assert.match(save.headers['content-disposition'], /^attachment;/)
+  assert.match(save.headers['content-disposition'], /filename="book\.xlsx"/)
 
   // A path that leaves the project answers like a path that does not exist.
   const outside = await request(`${origin}/share/${record.id}/api/blob?path=${encodeURIComponent('../outside.txt')}`, { headers: { cookie } })
-  assert.equal(outside.status, 403, 'the image does not leave the project')
+  assert.equal(outside.status, 403, 'the bytes do not leave the project')
 
+  await server.close()
+})
+
+test('the bytes of a file answer the window a viewer asks for', async () => {
+  const fixture = await setup()
+  const { origin, record, server, project } = fixture
+  const cookie = await unlock(fixture)
+
+  const body = Buffer.from('0123456789abcdef', 'utf8')
+  writeFileSync(join(project.root, 'clip.mp3'), body)
+
+  const window = await request(`${origin}/share/${record.id}/api/blob?path=clip.mp3`, {
+    headers: { cookie, range: 'bytes=4-7' },
+  })
+  assert.equal(window.status, 206, 'a window answers 206')
+  assert.equal(window.body, '4567')
+  assert.equal(window.headers['content-range'], 'bytes 4-7/16')
+  assert.equal(window.headers['content-length'], '4')
+  assert.equal(window.headers['content-type'], 'audio/mpeg')
+
+  const open = await request(`${origin}/share/${record.id}/api/blob?path=clip.mp3`, {
+    headers: { cookie, range: 'bytes=10-' },
+  })
+  assert.equal(open.status, 206)
+  assert.equal(open.body, 'abcdef')
+  assert.equal(open.headers['content-range'], 'bytes 10-15/16')
+
+  // The last bytes, the way a player asks for the tail of a recording.
+  const tail = await request(`${origin}/share/${record.id}/api/blob?path=clip.mp3`, {
+    headers: { cookie, range: 'bytes=-4' },
+  })
+  assert.equal(tail.status, 206)
+  assert.equal(tail.body, 'cdef')
+
+  // A window past the end tells the browser how long the file is.
+  const past = await request(`${origin}/share/${record.id}/api/blob?path=clip.mp3`, {
+    headers: { cookie, range: 'bytes=40-' },
+  })
+  assert.equal(past.status, 416)
+  assert.equal(past.headers['content-range'], 'bytes */16')
+
+  await server.close()
+})
+
+test('the host renders an Office document as a PDF for the guest', async () => {
+  const fixture = await setup()
+  const { origin, record, server, project } = fixture
+  const cookie = await unlock(fixture)
+
+  const book = Buffer.from('PK\u0003\u0004 the workbook of the project', 'utf8')
+  writeFileSync(join(project.root, 'book.xlsx'), book)
+  const rendered = Buffer.from('%PDF-1.7 the rendered document', 'utf8')
+  /** @type {any[]} */
+  const calls = []
+  const officeKit = {
+    async convert(request) {
+      calls.push(request)
+      const read = await request.source.read(new AbortController().signal, 1024)
+      return {
+        pdf: new Uint8Array(Buffer.concat([rendered, Buffer.from(' ' + read.bytes.length)])),
+        missingFonts: [],
+        cacheKey: 'key',
+        generation: 'generation',
+      }
+    },
+  }
+  // The kit the plugin resolves at run time is the one under test here.
+  const live = createShareService({
+    secret: SECRET,
+    sessionQuery: fixture.host.sessionQuery,
+    sessionController: fixture.host.sessionController,
+    fs: makeFs(project.root),
+    officeKit,
+  })
+  const liveServer = await startGuestServer(live)
+  const origin2 = liveServer.origin
+  const answer = await request(`${origin2}/share/${record.id}/api/office?path=book.xlsx`, { headers: { cookie } })
+  assert.equal(answer.status, 200)
+  assert.equal(answer.headers['content-type'], 'application/pdf')
+  assert.equal(answer.body, rendered.toString('utf8') + ' ' + book.length)
+  assert.equal(calls.length, 1, 'the document was rendered once')
+  assert.equal(calls[0].extension, 'xlsx')
+  assert.equal(calls[0].priority, 'foreground')
+  assert.equal(calls[0].source.bytes, book.length)
+
+  // A file that is not an Office document is not a document to render.
+  const other = await request(`${origin2}/share/${record.id}/api/office?path=inside.txt`, { headers: { cookie } })
+  assert.equal(other.status, 415)
+
+  // The boundary is the same one as for the text of a file.
+  const outside = await request(`${origin2}/share/${record.id}/api/office?path=${encodeURIComponent('../outside.xlsx')}`, { headers: { cookie } })
+  assert.equal(outside.status, 403)
+
+  await liveServer.close()
+  await server.close()
+})
+
+test('a Host without the Office kit tells the guest so', async () => {
+  const fixture = await setup()
+  const { origin, record, server, project } = fixture
+  const cookie = await unlock(fixture)
+  writeFileSync(join(project.root, 'book.xlsx'), Buffer.from('PK\u0003\u0004 a workbook', 'utf8'))
+
+  const answer = await request(`${origin}/share/${record.id}/api/office?path=book.xlsx`, { headers: { cookie } })
+  assert.equal(answer.status, 503, 'a capability the Host lacks is a state, not a crash')
+  assert.equal(answer.json().code, 'preview-unavailable')
+
+  // The file itself is still there: the guest downloads it instead.
+  const bytes = await request(`${origin}/share/${record.id}/api/blob?path=book.xlsx&download=1`, { headers: { cookie } })
+  assert.equal(bytes.status, 200)
+
+  await server.close()
+})
+
+test('a document that cannot be rendered is told, not left spinning', async () => {
+  const fixture = await setup()
+  const { origin, record, server, project } = fixture
+  const cookie = await unlock(fixture)
+  writeFileSync(join(project.root, 'broken.docx'), Buffer.from('this is not a document', 'utf8'))
+
+  const live = createShareService({
+    secret: SECRET,
+    sessionQuery: fixture.host.sessionQuery,
+    sessionController: fixture.host.sessionController,
+    fs: makeFs(project.root),
+    officeKit: {
+      async convert() {
+        const error = new Error('the document is not readable')
+        error.code = 'invalid-request'
+        throw error
+      },
+    },
+  })
+  const liveServer = await startGuestServer(live)
+  const answer = await request(`${liveServer.origin}/share/${record.id}/api/office?path=broken.docx`, { headers: { cookie } })
+  assert.equal(answer.status, 422)
+  assert.equal(answer.json().code, 'preview-failed')
+
+  // A Host busy with another document is a wait, not a failure.
+  const busyService = createShareService({
+    secret: SECRET,
+    sessionQuery: fixture.host.sessionQuery,
+    sessionController: fixture.host.sessionController,
+    fs: makeFs(project.root),
+    officeKit: {
+      async convert() {
+        const error = new Error('the converter is busy')
+        error.code = 'busy'
+        throw error
+      },
+    },
+  })
+  const busyServer = await startGuestServer(busyService)
+  const busy = await request(`${busyServer.origin}/share/${record.id}/api/office?path=broken.docx`, { headers: { cookie } })
+  assert.equal(busy.status, 503)
+  assert.equal(busy.json().code, 'preview-busy')
+  await busyServer.close()
+
+  await liveServer.close()
   await server.close()
 })
 

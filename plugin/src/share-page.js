@@ -569,10 +569,15 @@ body[data-panel="max"] .file-panel-handle { display: none; }
 .file-panel-heading { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .file-panel-tools { display: flex; align-items: center; gap: 6px; flex: none; }
 .file-tool {
-  height: 28px; padding: 0 10px; border: 1px solid var(--line); border-radius: var(--radius-sm);
-  background: var(--surface-2); color: var(--muted); font-size: 12px; cursor: pointer;
+  display: inline-flex; align-items: center; height: 28px; padding: 0 10px; border: 1px solid var(--line);
+  border-radius: var(--radius-sm); background: var(--surface-2); color: var(--muted); font-size: 12px;
+  text-decoration: none; cursor: pointer;
 }
 .file-tool:hover { color: var(--text); border-color: var(--line-strong); }
+/* A tool that does not belong to this file is not there: the display of the
+   tool would otherwise win over the hidden attribute, and a PDF would offer
+   a Source view it has none of. */
+.file-tool[hidden] { display: none; }
 .file-tool-icon { display: grid; place-items: center; width: 28px; padding: 0; }
 .max-restore { display: none; }
 body[data-panel="max"] .max-open { display: none; }
@@ -622,6 +627,32 @@ body[data-panel="max"] .max-restore { display: block; }
 .file-image { display: block; max-width: 100%; height: auto; margin: 14px auto; border-radius: var(--radius-sm); }
 .file-note { padding: 0 16px 14px; color: var(--faint); font-size: 12px; }
 .file-frame { width: 100%; height: calc(100vh - 120px); border: 0; background: #fff; }
+/* A document is not there the moment it is asked for: the Host may still be
+   rendering it, and the bytes still travel. The panel says so instead of
+   standing empty, so the guest knows the click did something. */
+.file-loading { display: flex; align-items: center; gap: 10px; padding: 22px 16px; color: var(--muted); font-size: 12px; }
+.file-spinner {
+  width: 14px; height: 14px; flex: none; border-radius: 50%;
+  border: 2px solid var(--line-strong); border-top-color: var(--accent);
+  animation: file-spin .9s linear infinite;
+}
+@keyframes file-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .file-spinner { animation: none; border-top-color: var(--accent); } }
+.file-media { display: block; width: 100%; max-height: calc(100vh - 170px); margin: 14px 0; background: #000; border-radius: var(--radius-sm); }
+.file-audio { display: block; width: calc(100% - 32px); margin: 18px 16px; }
+/* A file the browser cannot show is a file the guest can still take: the
+   panel says which of the two it is, and offers the download. */
+.file-unavailable { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 22px 16px; color: var(--muted); font-size: 13px; }
+.file-unavailable-icon { color: var(--faint); }
+.file-unavailable-name { color: var(--text); font-size: 14px; overflow-wrap: anywhere; }
+.file-unavailable-note { max-width: 46ch; line-height: 1.55; }
+.file-download {
+  display: inline-flex; align-items: center; height: 32px; padding: 0 14px;
+  border-radius: var(--radius-sm); background: var(--accent); color: var(--accent-contrast);
+  font-size: 12px; text-decoration: none;
+}
+.file-download:hover { filter: brightness(1.05); }
+.file-download:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .turn-frame { width: 100%; height: 420px; border: 1px solid var(--line); border-radius: var(--radius-md); background: #fff; }
 .turn-body a[href^="#file="] { cursor: pointer; }
 /* A message is a message: the type of the app's own transcript. A document in
@@ -781,6 +812,8 @@ function guestShell(title, permission, id, writable) {
     </div>
     <div class="file-panel-tools">
       ${writable ? '<button class="file-tool" id="fileEdit" type="button" hidden>Edit</button>' : ''}
+      <a class="file-tool" id="fileOpen" href="#" target="_blank" rel="noopener" hidden>Open</a>
+      <a class="file-tool" id="fileDownload" href="#" hidden>Download</a>
       <button class="file-tool file-tool-icon" id="fileMax" type="button" aria-label="Take the whole page" title="Take the whole page">
         <svg class="max-open" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6 2.5H2.5V6M10 2.5h3.5V6M13.5 10v3.5H10M2.5 10v3.5H6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <svg class="max-restore" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6 6H2.5V2.5M10 6h3.5V2.5M13.5 10v3.5H10M2.5 10v3.5H6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -1780,11 +1813,169 @@ function guestScript() {
     foot.appendChild(again);
   }
 
+  // The tools of the panel belong to the file that is in it.
+  var currentObjectUrl = null;
+  var fileToken = 0;
+
+  function fileBlobUrl(path, download) {
+    return base + 'api/blob?path=' + encodeURIComponent(path) + (download === true ? '&download=1' : '');
+  }
+
+  function releaseObjectUrl() {
+    if (currentObjectUrl === null) return;
+    try { URL.revokeObjectURL(currentObjectUrl); } catch (error) { /* the browser has already let it go */ }
+    currentObjectUrl = null;
+  }
+
+  function paintTools(kind, path) {
+    var open = document.getElementById('fileOpen');
+    var download = document.getElementById('fileDownload');
+    var edit = document.getElementById('fileEdit');
+    // A document opens in a tab of its own: on a phone that is the viewer of
+    // the system, and it is the one that shows a PDF full screen.
+    var standalone = kind === 'pdf' || kind === 'office' || kind === 'video' || kind === 'audio';
+    if (open !== null) {
+      open.hidden = !standalone;
+      open.setAttribute('href', standalone ? fileBlobUrl(path, false) : '#');
+    }
+    if (download !== null) {
+      download.hidden = false;
+      download.setAttribute('href', fileBlobUrl(path, true));
+    }
+    if (edit !== null) edit.hidden = !isTextual(path);
+  }
+
+  /**
+   * Say why a file is not on the screen, and offer the file itself.
+   *
+   * @param {HTMLElement} body the panel body
+   * @param {string} path the file of the project
+   * @param {string} title the name the panel shows
+   * @param {string} size the size the tree carried, if it carried one
+   * @param {string} note what the guest has to know
+   */
+  function paintUnavailable(body, path, title, size, note) {
+    var card = el('div', 'file-unavailable');
+    var icon = el('span', 'file-unavailable-icon');
+    // The glyph is the page's own: a file never brings markup with it.
+    icon.innerHTML = fileIconSvg(fileKindOf(path));
+    card.appendChild(icon);
+    card.appendChild(el('div', 'file-unavailable-name', title));
+    card.appendChild(el('div', 'file-unavailable-note', note));
+    // The file could not be opened here, so the tab of an "Open" would only
+    // download it without saying so: the download is the one offer.
+    var open = document.getElementById('fileOpen');
+    if (open !== null) open.hidden = true;
+    var link = el('a', 'file-download', 'Download the file');
+    link.setAttribute('href', fileBlobUrl(path, true));
+    link.setAttribute('download', '');
+    card.appendChild(link);
+    if (size.length > 0) card.appendChild(el('div', 'file-note', size));
+    body.appendChild(card);
+  }
+
+  /**
+   * Show a document the browser reads itself: a PDF, or the PDF the Host
+   * renders an Office document into.
+   *
+   * The bytes are asked for first, so a rendering that fails is a sentence in
+   * the panel instead of a frame that stays blank. The document then lives in
+   * an object URL of its own: the frame reads it, and the URL goes when the
+   * guest moves on.
+   */
+  function openDocument(path, kind, title, size) {
+    var body = document.getElementById('fileBody');
+    var token = fileToken;
+    var loading = el('div', 'file-loading');
+    loading.appendChild(el('span', 'file-spinner'));
+    loading.appendChild(el('span', null, kind === 'office' ? 'Rendering this document…' : 'Opening this document…'));
+    body.appendChild(loading);
+    var url = kind === 'office'
+      ? base + 'api/office?path=' + encodeURIComponent(path)
+      : fileBlobUrl(path, false);
+    fetch(url).then(function (response) {
+      if (!response.ok) {
+        // The Host says why it could not render the document: a guest who has
+        // to retry should know that, and a guest whose Host has no renderer
+        // should not be told to wait for one.
+        return response.json().then(function (body) {
+          var failure = new Error('refused');
+          failure.status = response.status;
+          failure.code = body && body.code;
+          throw failure;
+        }, function () {
+          var failure = new Error('refused');
+          failure.status = response.status;
+          throw failure;
+        });
+      }
+      return response.blob();
+    }).then(function (blob) {
+      if (token !== fileToken) return;
+      body.innerHTML = '';
+      releaseObjectUrl();
+      // A PDF is a PDF even when the header that says so was lost on the way:
+      // the viewer reads the bytes, and the type only helps it start.
+      currentObjectUrl = URL.createObjectURL(blob.type.length > 0 ? blob : new Blob([blob], { type: 'application/pdf' }));
+      var frame = el('iframe', 'file-frame');
+      frame.setAttribute('title', title);
+      frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.src = currentObjectUrl;
+      body.appendChild(frame);
+      // A browser without a viewer of its own cannot paint the frame: the
+      // guest is told where the document still opens, instead of facing an
+      // empty white panel and guessing.
+      body.appendChild(el('div', 'file-note', 'The document is shown by the viewer of your browser. If the panel stays blank, open it in a tab.'));
+      if (size.length > 0) body.appendChild(el('div', 'file-note', size));
+    }).catch(function (error) {
+      if (token !== fileToken) return;
+      body.innerHTML = '';
+      var status = error && error.status;
+      var note = status === 503 && error.code === 'preview-unavailable'
+        ? 'This Host cannot render this document here. Download the file and open it on your computer.'
+        : status === 503
+          ? 'The Host is busy with another document. Try again in a moment, or download the file.'
+          : status === 422
+            ? 'The Host could not render this document. Download the file and open it on your computer.'
+            : status === 413
+              ? 'This file is too large to open in the page.'
+              : 'This document could not be opened here.';
+      paintUnavailable(body, path, title, size, note);
+    });
+  }
+
+  /**
+   * Play a recording the browser reads itself.
+   *
+   * @param {string} path
+   * @param {string} kind 'video' or 'audio'
+   */
+  function openMedia(path, kind) {
+    var body = document.getElementById('fileBody');
+    if (kind === 'video') {
+      var video = el('video', 'file-media');
+      video.controls = true;
+      video.playsInline = true;
+      video.preload = 'metadata';
+      video.src = fileBlobUrl(path, false);
+      body.appendChild(video);
+      return;
+    }
+    var audio = el('audio', 'file-audio');
+    audio.controls = true;
+    audio.preload = 'metadata';
+    audio.src = fileBlobUrl(path, false);
+    body.appendChild(audio);
+  }
+
   function showFile(path, title, pathLabel, size) {
     currentFile = path;
     currentRaw = null;
     currentView = 'preview';
     currentVersion = '';
+    // Only the answer for the file that is open now may paint the panel.
+    fileToken += 1;
+    releaseObjectUrl();
     roomPost({ action: 'focus', file: path });
     document.getElementById('fileTitle').textContent = title;
     document.getElementById('filePath').textContent = pathLabel;
@@ -1795,29 +1986,27 @@ function guestScript() {
     document.getElementById('filePanel').hidden = false;
     document.body.setAttribute('data-panel', 'open');
     var filesToggle = document.getElementById('filesToggle');
-  var fileEdit = document.getElementById('fileEdit');
-  if (fileEdit) {
-    fileEdit.addEventListener('click', function () {
-      if (currentFile === null) return;
-      if (editing) {
-        setEditing(false);
-        paintFile(fileKindOf(currentFile), currentFile);
-        return;
-      }
-      setEditing(true);
-      openCollaborative(currentFile);
-    });
-  }
     if (filesToggle !== null) filesToggle.setAttribute('aria-pressed', 'true');
 
     var kind = fileKindOf(path);
+    paintTools(kind, path);
+
     if (kind === 'image') {
       var picture = el('img', 'file-image');
       picture.alt = title;
       // The page sits at /s/<id> without a trailing slash, so a relative
       // path would lose the share: the base carries it.
-      picture.src = base + 'api/blob?path=' + encodeURIComponent(path);
+      picture.src = fileBlobUrl(path, false);
       body.appendChild(picture);
+      if (size.length > 0) body.appendChild(el('div', 'file-note', size));
+      return;
+    }
+    if (kind === 'pdf' || kind === 'office') {
+      openDocument(path, kind, title, size);
+      return;
+    }
+    if (kind === 'video' || kind === 'audio') {
+      openMedia(path, kind);
       if (size.length > 0) body.appendChild(el('div', 'file-note', size));
       return;
     }
@@ -1829,9 +2018,20 @@ function guestScript() {
       if (editing) paintEditor();
       else paintFile(kind, path);
     }).catch(function (error) {
-      body.textContent = error && error.status === 415
-        ? 'This file is not text, so it cannot be previewed here.'
-        : 'This file could not be read.';
+      // A file this page cannot read as text is a file the guest can still
+      // take: an archive, a font, a document the Host cannot render.
+      if (error && error.status === 415) {
+        body.innerHTML = '';
+        paintUnavailable(
+          body,
+          path,
+          title,
+          size,
+          'The browser cannot show this kind of file. Download it and open it on your computer.',
+        );
+        return;
+      }
+      body.textContent = 'This file could not be read.';
     });
   }
 
@@ -1910,9 +2110,29 @@ function guestScript() {
 
   var close = document.getElementById('fileClose');
   var filesToggle = document.getElementById('filesToggle');
-  var panelHidden = function () { document.getElementById('filePanel').hidden = true; document.body.removeAttribute('data-panel'); };
+  var panelHidden = function () {
+    document.getElementById('filePanel').hidden = true;
+    document.body.removeAttribute('data-panel');
+    // The document is not on the screen any more: its bytes go with it.
+    releaseObjectUrl();
+  };
   if (close) {
     close.addEventListener('click', panelHidden);
+  }
+  // The Edit button belongs to the file in the panel. It is wired once: a
+  // listener per opened file would write the same text once per file visited.
+  var fileEdit = document.getElementById('fileEdit');
+  if (fileEdit) {
+    fileEdit.addEventListener('click', function () {
+      if (currentFile === null) return;
+      if (editing) {
+        setEditing(false);
+        paintFile(fileKindOf(currentFile), currentFile);
+        return;
+      }
+      setEditing(true);
+      openCollaborative(currentFile);
+    });
   }
   // The header opens the panel again, with the file that was open in it.
   if (filesToggle) {
@@ -2501,9 +2721,24 @@ function guestScript() {
       }
       if (payload.kind === 'file') {
         // A file changed under the guest: the one they have open is read
-        // again, so nobody works on a text that is no longer there.
+        // again, so nobody works on a text that is no longer there. A
+        // document is rendered again for the same reason: the PDF on the
+        // screen would otherwise be the document as it was.
         if (payload.path === currentFile && !editing) {
           var kind = fileKindOf(currentFile);
+          if (kind === 'pdf' || kind === 'office') {
+            var documentBody = document.getElementById('fileBody');
+            documentBody.innerHTML = '';
+            fileToken += 1;
+            releaseObjectUrl();
+            openDocument(currentFile, kind, document.getElementById('fileTitle').textContent, '');
+            return;
+          }
+          if (kind === 'video' || kind === 'audio') {
+            document.getElementById('fileBody').innerHTML = '';
+            openMedia(currentFile, kind);
+            return;
+          }
           getText('api/file?path=' + encodeURIComponent(currentFile)).then(function (read) {
             currentRaw = read.text;
             currentVersion = read.version;

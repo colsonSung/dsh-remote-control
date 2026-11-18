@@ -44,7 +44,13 @@ import { renderGuestPage } from './share-page.js'
 import { createShareRooms } from './share-room.js'
 import { createShareQueues } from './share-queue.js'
 import { createCollab } from './share-collab.js'
-import { fileKindOf } from './share-files.js'
+import {
+  contentDispositionOf,
+  contentTypeOf,
+  downloadNameOf,
+  officeExtensionOf,
+  parseByteRange,
+} from './share-media.js'
 import {
   createAssetStore,
   SHARE_ASSET_MAX_AGE_SECONDS,
@@ -71,7 +77,27 @@ const SHARE_ATTACHMENT_MAX_BYTES = 12 * 1024 * 1024
 /** How long a guest may be silent before the room forgets it. */
 const SHARE_GUEST_SILENCE_MS = 90_000
 
-const SHARE_MAX_FILE_BYTES = 2 * 1024 * 1024
+/**
+ * The largest file a guest may take as bytes.
+ *
+ * A project holds recordings and archives as readily as it holds a README, and
+ * a guest that opens one should get the file itself rather than a refusal. The
+ * bytes travel through this process and over the tunnel, so the cap stays
+ * finite; a file above it is told so, with the size and the reason.
+ */
+const SHARE_BLOB_MAX_BYTES = 64 * 1024 * 1024
+
+/** The largest Office document the Host renders for a guest. */
+const SHARE_OFFICE_MAX_BYTES = 50 * 1024 * 1024
+
+/**
+ * How long one Office document may take to render.
+ *
+ * The conversion is LibreOffice: a deck of eighty slides is minutes of work on
+ * a busy machine, and a guest that waits longer than this is told so instead
+ * of watching a spinner that will never stop.
+ */
+const SHARE_OFFICE_TIMEOUT_MS = 120_000
 
 /** The largest number of messages the guest view carries at once. */
 export const SHARE_MAX_MESSAGES = 200
@@ -223,30 +249,6 @@ export function textOfContent(content) {
 }
 
 /**
- * The media type of one image.
- *
- * @param {string} path
- * @returns {string} the media type, or the empty string
- */
-export function imageTypeOf(path) {
-  const name = String(path ?? '').split('/').pop() ?? ''
-  const dot = name.lastIndexOf('.')
-  const extension = dot < 0 ? '' : name.slice(dot + 1).toLowerCase()
-  const types = {
-    png: 'image/png',
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    gif: 'image/gif',
-    webp: 'image/webp',
-    avif: 'image/avif',
-    ico: 'image/x-icon',
-    bmp: 'image/bmp',
-    svg: 'image/svg+xml',
-  }
-  return types[extension] ?? ''
-}
-
-/**
  * The guest view of one session event.
  *
  * Only the conversation is shown here: the rest of the log carries tool
@@ -321,6 +323,7 @@ export function projectMessages(events) {
  * @param {any} [options.sessionQuery] the host session query service
  * @param {any} [options.sessionController] the host session controller service
  * @param {any} [options.fs] the host filesystem service
+ * @param {any} [options.officeKit] the host Office kit: the service that turns a document into a PDF
  * @param {string | (() => string | undefined | Promise<string | undefined>) | undefined} [options.mermaidPath] where the mermaid bundle lives: a path, or a function that answers one
  * @param {(message: string, extra?: unknown) => void} [options.log]
  * @param {() => number} [options.now]
@@ -1207,6 +1210,15 @@ export function createShareService(options = {}) {
           await this.serveBlob(req, res, share)
           return
         }
+        if (action === 'office') {
+          if (method !== 'GET' && method !== 'HEAD') {
+            sendText(res, 405, 'method not allowed')
+            return
+          }
+          if (!this.requireGuest(req, res, share)) return
+          await this.serveOffice(req, res, share)
+          return
+        }
         if (action === 'asset') {
           if (method !== 'GET' && method !== 'HEAD') {
             sendText(res, 405, 'method not allowed')
@@ -2057,6 +2069,20 @@ export function createShareService(options = {}) {
       }
     },
 
+    /**
+     * Read one file of the project as bytes.
+     *
+     * The guest's browser is the viewer here: a PDF is handed to the viewer of
+     * the browser, a recording to its player, a picture to the page, and a
+     * file the browser cannot show is a download. The bytes are read inside a
+     * byte range, because a PDF viewer asks for the window it is about to show
+     * and a phone that seeks in a recording asks for the middle of it.
+     *
+     * @param {import('node:http').IncomingMessage} req
+     * @param {import('node:http').ServerResponse} res
+     * @param {any} share
+     * @returns {Promise<void>}
+     */
     async serveBlob(req, res, share) {
       const fs = service('fs', options.fs)
       const root = await projectRootOf(share)
@@ -2066,6 +2092,7 @@ export function createShareService(options = {}) {
       }
       const url = new URL(String(req.url ?? '/'), 'http://share.invalid')
       const candidate = url.searchParams.get('path') ?? ''
+      const download = url.searchParams.get('download') === '1'
       // The boundary first: a path outside the project answers the same way
       // here as it does for the text of a file.
       const resolved = await resolveWithinRoot(fs, root, candidate)
@@ -2073,26 +2100,215 @@ export function createShareService(options = {}) {
         sendText(res, 403, 'forbidden')
         return
       }
-      // Only the images the preview shows travel as bytes; everything else is
-      // text the guest reads.
-      const type = imageTypeOf(candidate)
-      if (type === '' || fileKindOf(candidate) !== 'image') {
-        sendText(res, 415, 'not an image')
+      let info
+      try {
+        info = await fs.lstat(candidate, { cwd: root })
+      } catch {
+        info = undefined
+      }
+      const size = typeof info?.size === 'number'
+        ? info.size
+        : typeof resolved.size === 'number'
+          ? resolved.size
+          : 0
+      if (size > SHARE_BLOB_MAX_BYTES) {
+        sendText(res, 413, 'this file is too large to send through a share link')
         return
       }
-      try {
-        const bytes = await fs.readByteRange(resolved.target, { offset: 0, length: SHARE_MAX_FILE_BYTES }, undefined)
-        const buffer = Buffer.from(bytes?.buffer ?? bytes, bytes?.byteOffset ?? 0, bytes?.byteLength ?? bytes?.length ?? 0)
-        res.writeHead(200, {
-          'content-type': type,
-          'content-length': String(buffer.length),
-          'x-content-type-options': 'nosniff',
+      const type = contentTypeOf(candidate)
+      const range = parseByteRange(req.headers.range, size)
+      if (range === null) {
+        // The window starts past the end of the file: the browser is told how
+        // long the file is, and asks again for a window that exists.
+        res.writeHead(416, {
+          'content-range': `bytes */${size}`,
+          'accept-ranges': 'bytes',
           'cache-control': 'no-store',
         })
-        res.end(buffer)
-      } catch (error) {
-        log('share: an image could not be read', { error: String(error) })
+        res.end()
+        return
+      }
+      const start = range === undefined ? 0 : range.start
+      const end = range === undefined ? size - 1 : range.end
+      const length = size === 0 ? 0 : end - start + 1
+      let buffer = Buffer.alloc(0)
+      if (length > 0) {
+        try {
+          const bytes = await fs.readByteRange(resolved.target, { offset: start, length }, undefined)
+          buffer = Buffer.from(bytes?.buffer ?? bytes, bytes?.byteOffset ?? 0, bytes?.byteLength ?? bytes?.length ?? 0)
+        } catch (error) {
+          log('share: a file could not be read', { path: candidate, error: String(error) })
+          sendText(res, 403, 'forbidden')
+          return
+        }
+      }
+      // A picture, a document the browser reads itself and a recording are
+      // shown in place; everything else is saved under its own name, because
+      // the browser would otherwise guess at bytes it cannot paint.
+      const inline = download !== true && (
+        type.startsWith('image/')
+        || type === 'application/pdf'
+        || type.startsWith('video/')
+        || type.startsWith('audio/')
+        || type.startsWith('text/')
+        || type.startsWith('application/json')
+        || type.startsWith('application/xml')
+      )
+      /** @type {Record<string, string>} */
+      const head = {
+        'content-type': type,
+        'content-length': String(buffer.length),
+        'accept-ranges': 'bytes',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        'content-disposition': contentDispositionOf(candidate, inline),
+      }
+      if (type === 'image/svg+xml') {
+        // An SVG is a document with scripts of its own. Served from this
+        // origin it could speak to the share with the guest's cookie, so the
+        // browser runs nothing in it; a picture in an `img` is unaffected.
+        head['content-security-policy'] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+      }
+      if (range !== undefined) head['content-range'] = `bytes ${start}-${end}/${size}`
+      res.writeHead(range === undefined ? 200 : 206, head)
+      if (String(req.method ?? 'GET').toUpperCase() === 'HEAD') {
+        res.end()
+        return
+      }
+      res.end(buffer)
+    },
+
+    /**
+     * Render one Office document as a PDF for the guest.
+     *
+     * The browser cannot read a DOCX or a workbook: the Host can. Its Office
+     * kit turns the document into a PDF, the guest's browser shows that PDF,
+     * and the document itself stays the file it is — nothing is written back
+     * into the project.
+     *
+     * A Host without the kit answers `preview-unavailable`, and the page
+     * offers the file as a download instead: a capability the Host does not
+     * have is a state the guest is told about, not a broken panel.
+     *
+     * @param {import('node:http').IncomingMessage} req
+     * @param {import('node:http').ServerResponse} res
+     * @param {any} share
+     * @returns {Promise<void>}
+     */
+    async serveOffice(req, res, share) {
+      const fs = service('fs', options.fs)
+      const root = await projectRootOf(share)
+      if (fs === undefined || root === undefined) {
         sendText(res, 403, 'forbidden')
+        return
+      }
+      const url = new URL(String(req.url ?? '/'), 'http://share.invalid')
+      const candidate = url.searchParams.get('path') ?? ''
+      const extension = officeExtensionOf(candidate)
+      if (extension === '') {
+        sendText(res, 415, 'this file is not an office document')
+        return
+      }
+      // The boundary first, exactly as the text of a file crosses it.
+      const resolved = await resolveWithinRoot(fs, root, candidate)
+      if (!resolved.ok) {
+        sendText(res, 403, 'forbidden')
+        return
+      }
+      const office = service('officeKit', options.officeKit)
+      if (office === undefined || typeof office.convert !== 'function') {
+        sendJson(res, 503, {
+          ok: false,
+          code: 'preview-unavailable',
+          error: 'this host cannot render office documents',
+        })
+        return
+      }
+      let info
+      try {
+        info = await fs.lstat(candidate, { cwd: root })
+      } catch {
+        info = undefined
+      }
+      const size = typeof info?.size === 'number'
+        ? info.size
+        : typeof resolved.size === 'number'
+          ? resolved.size
+          : 0
+      if (size > SHARE_OFFICE_MAX_BYTES) {
+        sendJson(res, 413, {
+          ok: false,
+          code: 'too-large',
+          error: 'this document is too large to render',
+        })
+        return
+      }
+      // The version of the file is the source identity of the conversion: a
+      // document that moves on while the converter reads it is refused rather
+      // than previewed as a document that no longer exists.
+      const version = typeof info?.version === 'string' ? info.version : ''
+      try {
+        const result = await office.convert({
+          extension,
+          priority: 'foreground',
+          source: {
+            key: `share:${share.id}:${candidate}`,
+            version,
+            bytes: size,
+            read: async (signal, maxBytes) => {
+              const wanted = typeof maxBytes === 'number' && maxBytes > 0 ? Math.min(maxBytes, size) : size
+              const bytes = await fs.readByteRange(resolved.target, { offset: 0, length: wanted }, signal)
+              let after = ''
+              try {
+                after = String((await fs.lstat(candidate, { cwd: root }))?.version ?? '')
+              } catch {
+                after = ''
+              }
+              return { bytes, version: after }
+            },
+          },
+        }, AbortSignal.timeout(SHARE_OFFICE_TIMEOUT_MS))
+        const pdf = Buffer.from(result?.pdf ?? [])
+        if (pdf.length === 0) throw new Error('the conversion returned no document')
+        res.writeHead(200, {
+          'content-type': 'application/pdf',
+          'content-length': String(pdf.length),
+          'content-disposition': contentDispositionOf(`${downloadNameOf(candidate)}.pdf`, true),
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+        })
+        res.end(pdf)
+      } catch (error) {
+        log('share: a document could not be rendered', { path: candidate, error: String(error) })
+        if (res.headersSent) {
+          res.end()
+          return
+        }
+        // The kit names its own refusals: a Host that is busy rendering
+        // another document is a "wait a moment", not a broken document, and a
+        // Host without the kit says so instead of pretending it failed.
+        const code = /** @type {any} */ (error)?.code
+        if (code === 'busy') {
+          sendJson(res, 503, {
+            ok: false,
+            code: 'preview-busy',
+            error: 'the host is rendering another document',
+          })
+          return
+        }
+        if (code === 'unavailable') {
+          sendJson(res, 503, {
+            ok: false,
+            code: 'preview-unavailable',
+            error: 'this host cannot render office documents',
+          })
+          return
+        }
+        sendJson(res, 422, {
+          ok: false,
+          code: 'preview-failed',
+          error: 'this document could not be rendered',
+        })
       }
     },
 

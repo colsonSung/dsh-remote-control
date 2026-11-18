@@ -49,7 +49,15 @@ sessions, the owner's credentials or the owner's other shares.
 | **Read or write** | a read share shows the conversation; a write share lets the guest send messages into it |
 | **A queue, not a stampede** | the agent answers one message at a time, and every guest of the share sees the same queue at the same moment |
 | **Documents together** | the guests of a share may edit one file at the same time, and the agent's own writes are guarded by the version of the file |
+| **Any file of the project** | a picture, a PDF and a recording open in place; a DOCX, XLSX or PPTX is rendered by the host into a PDF and shown like one; anything else is a download that keeps its name |
 | **The owner sees who is there** | the guests of the share appear in the corner of the conversation, and the one that is writing is marked while it writes |
+
+The guest opens the files of the task's project folder, not only the Markdown:
+PDFs and recordings play in the page, and an Office document is turned into a PDF
+by the host — the browser never needed to read a workbook. A file the browser
+cannot show is offered as a download, with the reason written next to it. The
+bytes of a file travel in byte ranges, so a PDF viewer jumps to page forty
+without reading the first thirty-nine.
 
 The owner opens **Settings → Remote Control → Share this conversation**, gets the
 link and the passcode, and can revoke the link at any time. The relay carries
